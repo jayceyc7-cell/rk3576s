@@ -46,7 +46,7 @@ set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 file(GLOB SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 
 add_executable(${PROJECT_NAME}
-    main_threed.cc
+    main.cc
     postprocess.cc
     rknn_pool.cc
     ${rknpu_yolov8_file}

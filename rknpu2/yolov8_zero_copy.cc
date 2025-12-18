@@ -303,25 +303,25 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     rknn_set_core_mask(app_ctx->rknn_ctx, RKNN_NPU_CORE_0_1);
     // Run
     printf("rknn_run\n");
-    // ret = rknn_run(app_ctx->rknn_ctx, nullptr);
-    // if (ret < 0) {
-    //     printf("rknn_run fail! ret=%d\n", ret);
-    //     return -1;
-    // }
-    int count = 0;
-    while (1)
-    {
-        ret = rknn_run(app_ctx->rknn_ctx, nullptr);
-        if (ret < 0)
-        {
-            printf("rknn_run fail! ret=%d\n", ret);
-            return -1;
-        }
-        count++;
-        if (count >= 1000) {
-            break;
-        }
+    ret = rknn_run(app_ctx->rknn_ctx, nullptr);
+    if (ret < 0) {
+        printf("rknn_run fail! ret=%d\n", ret);
+        return -1;
     }
+    // int count = 0;
+    // while (1)
+    // {
+    //     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
+    //     if (ret < 0)
+    //     {
+    //         printf("rknn_run fail! ret=%d\n", ret);
+    //         return -1;
+    //     }
+    //     count++;
+    //     if (count >= 1000) {
+    //         break;
+    //     }
+    // }
 
     // 结束计时
     gettimeofday(&end3, NULL);
