@@ -102,7 +102,7 @@ int init_yolov8_model(const char *model_path, rknn_app_context_t *app_ctx) {
         output_native_attrs[i].index = i;
         // output_native_attrs[i].fmt = RKNN_TENSOR_NCHW;
         ret = rknn_query(ctx, RKNN_QUERY_NATIVE_NHWC_OUTPUT_ATTR, &(output_native_attrs[i]), sizeof(rknn_tensor_attr));
-        // ret = rknn_query(ctx, RKNN_QUERY_NATIVE_OUTPUT_ATTR, &(output_native_attrs[i]), sizeof(rknn_tensor_attr));
+        //ret = rknn_query(ctx, RKNN_QUERY_NATIVE_OUTPUT_ATTR, &(output_native_attrs[i]), sizeof(rknn_tensor_attr));
         if (ret != RKNN_SUCC) {
             printf("rknn_query fail! ret=%d\n", ret);
             return -1;
@@ -351,7 +351,7 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
                 memcpy(outputs[i].buf, app_ctx->output_mems[i]->virt_addr, outputs[i].size);
             }
         } else {
-            printf("Currently zero copy does not support fp16!\n");
+            printf("QCurrently zero copy does not support fp16!\n");
             //goto out;
         }
     }
