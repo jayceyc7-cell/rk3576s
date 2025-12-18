@@ -230,8 +230,10 @@ int main(int argc, char **argv)
     const int thread_count = 2;
     const char* label_path = nullptr;
 
-    int queue_num = 0;   //在队列中的未取出的结果
+    int output_num = 0;   //在队列中的未取出的结果
+    int input_num = 0;
     int min_time = 20;  //最少的运行时间
+    int delay = 0;
 
     std::vector<BBox> all_dets;
     std::vector<BBox> all_gts;
@@ -244,32 +246,39 @@ int main(int argc, char **argv)
     
     gettimeofday(&start, NULL);
     struct dirent *ptr;
-    while((ptr = readdir(dir)) != NULL)
+    bool is_read = 1;
+    while(is_read or input_num > output_num)
     {
-        std::string name = ptr->d_name;
-        if (name.size() < 4)
-            continue;
-        if (name.substr(name.size() - 4) != ".jpg" &&
-            name.substr(name.size() - 4) != ".png")
-            continue;
+        gettimeofday(&one_start, NULL);
+        if(is_read and (ptr = readdir(dir)) != NULL){
+            std::string name = ptr->d_name;
+            if (name.size() < 4)
+                continue;
+            if (name.substr(name.size() - 4) != ".jpg" &&
+                name.substr(name.size() - 4) != ".png")
+                continue;
 
-        std::string img_path = img_dir + name;
-        printf("img_path: %s\n", img_path.c_str());
-        std::string txt_path = label_dir + name.substr(0, name.size() - 4) + ".txt";
+            std::string img_path = img_dir + name;
+            printf("img_path: %s\n", img_path.c_str());
+            std::string txt_path = label_dir + name.substr(0, name.size() - 4) + ".txt";
 
-        // 读取图片
-        auto src = std::make_unique<image_buffer_t>(image_buffer_t{});
-        if (read_image(img_path.c_str(), src.get()) != 0)
-            continue;
+            // 读取图片
+            auto src = std::make_unique<image_buffer_t>(image_buffer_t{});
+            if (read_image(img_path.c_str(), src.get()) != 0)
+                continue;
 
-        // 送入推理
-        rknn_pool->AddInferenceTask(std::move(src), txt_path);
-        queue_num++;
+            // 送入推理
+            rknn_pool->AddInferenceTask(std::move(src), txt_path);
+            input_num++;
+        }else{
+            is_read = 0;
+        }
         
-        printf("\nqueue_num: %d\n", queue_num);
+        printf("\n input: %d\n", input_num);
+        printf("\n output: %d\n", output_num);
         od_res = rknn_pool->GetImageResultFromQueue();
         if(od_res != nullptr){
-            queue_num--;
+            output_num++;
             std::shared_ptr<object_detect_result_list> result = od_res.get()->result;
             std::shared_ptr<image_buffer_t> img = od_res.get()->img;
             // 处理预测框
@@ -291,36 +300,15 @@ int main(int argc, char **argv)
             auto gts = load_gt_boxes(od_res.get()->txt_path, img.get()->width, img.get()->height);
             all_gts.insert(all_gts.end(), gts.begin(), gts.end());
         }
-    }
-
-    while(queue_num > 0){
-        printf("\nqueue_num: %d\n", queue_num);
-        od_res = rknn_pool->GetImageResultFromQueue();
-        if(od_res != nullptr){
-            queue_num--;
-            std::shared_ptr<object_detect_result_list> result = od_res.get()->result;
-            std::shared_ptr<image_buffer_t> img = od_res.get()->img;
-            // 处理预测框
-            for (int i = 0; i < result.get()->count; i++)
-            {
-                object_detect_result *r = &(result.get()->results[i]);
-                BBox b;
-                b.x1 = r->box.left;
-                b.y1 = r->box.top;
-                b.x2 = r->box.right;
-                b.y2 = r->box.bottom;
-                b.cls = r->cls_id;
-                b.score = r->prop;
-                //b.print_b();
-                all_dets.push_back(b);
-            }
-
-            // 加载 GT
-            auto gts = load_gt_boxes(od_res.get()->txt_path, img.get()->width, img.get()->height);
-            all_gts.insert(all_gts.end(), gts.begin(), gts.end());
+        gettimeofday(&one_end, NULL);
+        time_use = (end.tv_sec - start.tv_sec) * 1000.0 +
+            (end.tv_usec - start.tv_usec) / 1000.0;
+        if(time_use < min_time){
+            delay = int(min_time - time_use);
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(min_time));
     }
+
     gettimeofday(&end, NULL);
 
     closedir(dir);
