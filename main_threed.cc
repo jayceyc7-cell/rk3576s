@@ -211,8 +211,8 @@ int main(int argc, char **argv)
     //      模型评估：Precision，Recall，F1，mAP50/75/50-95
     // ==========================================================
 
-    std::string img_dir = "/root/special_test_delete/images/test1/";
-    std::string label_dir = "/root/special_test_delete/labels/test1/";
+    std::string img_dir = "/root/special_test_delete/images/test2/";
+    std::string label_dir = "/root/special_test_delete/labels/test2/";
 
     struct timeval start, end;
     struct timeval one_start, one_end;
@@ -227,12 +227,12 @@ int main(int argc, char **argv)
 
     const char *model_path = argv[1];
     const char *image_path = argv[2];
-    const int thread_count = 2;
+    const int thread_count = 3;
     const char* label_path = nullptr;
 
     int output_num = 0;   //在队列中的未取出的结果
     int input_num = 0;
-    int min_time = 20;  //最少的运行时间
+    int min_time = 40;  //最少的运行时间
     int delay = 0;
 
     std::vector<BBox> all_dets;
@@ -259,8 +259,8 @@ int main(int argc, char **argv)
                 continue;
 
             std::string img_path = img_dir + name;
-            printf("img_path: %s\n", img_path.c_str());
             std::string txt_path = label_dir + name.substr(0, name.size() - 4) + ".txt";
+            printf("\ntxt_path: %s\n", txt_path.c_str());
 
             // 读取图片
             auto src = std::make_unique<image_buffer_t>(image_buffer_t{});
@@ -281,7 +281,6 @@ int main(int argc, char **argv)
             output_num++;
             std::shared_ptr<object_detect_result_list> result = od_res.get()->result;
             std::shared_ptr<image_buffer_t> img = od_res.get()->img;
-            // 处理预测框
             for (int i = 0; i < result.get()->count; i++)
             {
                 object_detect_result *r = &(result.get()->results[i]);
@@ -292,17 +291,19 @@ int main(int argc, char **argv)
                 b.y2 = r->box.bottom;
                 b.cls = r->cls_id;
                 b.score = r->prop;
-                // b.print_b();
+                //b.print_b();
                 all_dets.push_back(b);
             }
 
             // 加载 GT
             auto gts = load_gt_boxes(od_res.get()->txt_path, img.get()->width, img.get()->height);
             all_gts.insert(all_gts.end(), gts.begin(), gts.end());
+            od_res.reset(); 
         }
         gettimeofday(&one_end, NULL);
-        time_use = (end.tv_sec - start.tv_sec) * 1000.0 +
-            (end.tv_usec - start.tv_usec) / 1000.0;
+        time_use = (one_end.tv_sec - one_start.tv_sec) * 1000.0 +
+            (one_end.tv_usec - one_start.tv_usec) / 1000.0;
+        printf("time_use: %.3f ms\n", time_use);
         if(time_use < min_time){
             delay = int(min_time - time_use);
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));

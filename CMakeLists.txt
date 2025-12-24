@@ -38,6 +38,20 @@ set(rknpu_yolov8_file rknpu2/yolov8.cc)
 #     set(rknpu_yolov8_file rknpu1/yolov8.cc)
 # endif()
 
+# # ========== OpenCV ==========
+# set(OPENCV_ROOT
+#     ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/opencv/opencv-linux-aarch64
+# )
+
+# set(OPENCV_INCLUDE_DIR
+#     ${OPENCV_ROOT}/include
+# )
+
+# set(OPENCV_LIB_DIR
+#     ${OPENCV_ROOT}/lib
+# )
+
+
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/ 3rdparty.out)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../utils/ utils.out)
 
@@ -46,9 +60,13 @@ set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 file(GLOB SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 
 add_executable(${PROJECT_NAME}
-    main.cc
+    main_camera.cc
     postprocess.cc
     rknn_pool.cc
+    awi_track.cpp
+    BallTrack.cpp
+    kalmanFilter.cpp
+    STrack.cpp
     ${rknpu_yolov8_file}
 )
 

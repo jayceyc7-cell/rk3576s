@@ -44,7 +44,6 @@ inline ThreadPool::ThreadPool(size_t threads) : stop(false) {
       pthread_setname_np(pthread_self(), thread_name.c_str());
       for (;;) {
         std::function<void()> task;
-
         {
           std::unique_lock<std::mutex> lock(this->queue_mutex);
           this->condition.wait(

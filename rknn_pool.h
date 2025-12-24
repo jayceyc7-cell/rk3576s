@@ -13,6 +13,7 @@ class Output {
     std::shared_ptr<image_buffer_t> img;
     std::shared_ptr<object_detect_result_list> result;
     std::string txt_path;
+    ~Output();
 };
 
 class RknnPool {

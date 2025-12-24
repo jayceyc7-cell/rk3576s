@@ -253,9 +253,28 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
 
     // 开始计时
     gettimeofday(&start2, NULL);
-    // Run
     printf("rknn_run\n");
     //fflush(stdout);
+    // while (1)
+    // {
+    //         // 开始计时
+    //     gettimeofday(&start2, NULL);
+    //     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
+    //     if (ret < 0)
+    //     {
+    //         printf("rknn_run fail! ret=%d\n", ret);
+    //         return -1;
+    //     }
+    //         // 结束计时
+    //     gettimeofday(&end2, NULL);
+
+        // 计算耗时（微秒→毫秒）
+        // time_use2 = (end2.tv_sec - start2.tv_sec) * 1000.0 +
+        //        (end2.tv_usec - start2.tv_usec) / 1000.0;
+        // printf("inference_yolov8_model rknpu2 耗时：%.3f ms\n", time_use2);
+
+    // }
+
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
     if (ret < 0)
     {
@@ -268,8 +287,6 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     // 计算耗时（微秒→毫秒）
     time_use2 = (end2.tv_sec - start2.tv_sec) * 1000.0 +
                (end2.tv_usec - start2.tv_usec) / 1000.0;
-    // fflush(stdout);
-    // fflush(stdout);
     printf("inference_yolov8_model rknpu2 耗时：%.3f ms\n", time_use2);
 
     // Get Output

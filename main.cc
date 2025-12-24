@@ -3,137 +3,137 @@
 /*-------------------------------------------
                 图片检测
 -------------------------------------------*/
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/time.h>
+// #include <stdint.h>
+// #include <stdio.h>
+// #include <stdlib.h>
+// #include <string.h>
+// #include <sys/time.h>
 
-#include <vector>
-#include <string>
-#include <fstream>
-#include <sstream>
-#include <algorithm>
-#include <cmath>
+// #include <vector>
+// #include <string>
+// #include <fstream>
+// #include <sstream>
+// #include <algorithm>
+// #include <cmath>
 
-#include "yolov8.h"
-#include "image_utils.h"
-#include "file_utils.h"
-#include "image_drawing.h"
-#include "rknn_api.h"
-#include "dirent.h"
+// #include "yolov8.h"
+// #include "image_utils.h"
+// #include "file_utils.h"
+// #include "image_drawing.h"
+// #include "rknn_api.h"
+// #include "dirent.h"
 
-#if defined(RV1106_1103) 
-    #include "dma_alloc.hpp"
-#endif
+// #if defined(RV1106_1103) 
+//     #include "dma_alloc.hpp"
+// #endif
 
-/*-------------------------------------------
-                  Main Function
--------------------------------------------*/
-int main(int argc, char **argv)
-{
-    //setbuf(stdout, NULL); // 禁用 stdout 缓冲
+// /*-------------------------------------------
+//                   Main Function
+// -------------------------------------------*/
+// int main(int argc, char **argv)
+// {
+//     //setbuf(stdout, NULL); // 禁用 stdout 缓冲
 
-    struct timeval start, end;
-    double time_use = 0;
-    printf("example for yolov8 wyc!!\n");
-    if (argc != 3)
-    {
-        printf("%s <model_path> <image_path>\n", argv[0]);
-        return -1;
-    }
+//     struct timeval start, end;
+//     double time_use = 0;
+//     printf("example for yolov8 wyc!!\n");
+//     if (argc != 3)
+//     {
+//         printf("%s <model_path> <image_path>\n", argv[0]);
+//         return -1;
+//     }
 
-    const char *model_path = argv[1];
-    const char *image_path = argv[2];
+//     const char *model_path = argv[1];
+//     const char *image_path = argv[2];
 
-    int ret;
-    rknn_app_context_t rknn_app_ctx;
-    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
+//     int ret;
+//     rknn_app_context_t rknn_app_ctx;
+//     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
 
-    init_post_process();
+//     init_post_process();
 
-    ret = init_yolov8_model(model_path, &rknn_app_ctx);
-    if (ret != 0)
-    {
-        printf("init_yolov8_model fail! ret=%d model_path=%s\n", ret, model_path);
-        deinit_post_process();
+//     ret = init_yolov8_model(model_path, &rknn_app_ctx);
+//     if (ret != 0)
+//     {
+//         printf("init_yolov8_model fail! ret=%d model_path=%s\n", ret, model_path);
+//         deinit_post_process();
 
-        ret = release_yolov8_model(&rknn_app_ctx);
-        if (ret != 0)
-        {
-            printf("release_yolov8_model fail! ret=%d\n", ret);
-        }
-        // goto out;
-    }
-    //图片检测
-    image_buffer_t src_image;
-    memset(&src_image, 0, sizeof(image_buffer_t));
-    ret = read_image(image_path, &src_image);
+//         ret = release_yolov8_model(&rknn_app_ctx);
+//         if (ret != 0)
+//         {
+//             printf("release_yolov8_model fail! ret=%d\n", ret);
+//         }
+//         // goto out;
+//     }
+//     //图片检测
+//     image_buffer_t src_image;
+//     memset(&src_image, 0, sizeof(image_buffer_t));
+//     ret = read_image(image_path, &src_image);
 
     
 
 
-    if (ret != 0)
-    {
-        printf("read image fail! ret=%d image_path=%s\n", ret, image_path);
-        goto out;
-    }
+//     if (ret != 0)
+//     {
+//         printf("read image fail! ret=%d image_path=%s\n", ret, image_path);
+//         goto out;
+//     }
 
-    object_detect_result_list od_results;
-    // 开始计时
-    gettimeofday(&start, NULL);
-    ret = inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
-    if (ret != 0)
-    {
-        printf("init_yolov8_model fail! ret=%d\n", ret);
-        goto out;
-    }
-    gettimeofday(&end, NULL);
+//     object_detect_result_list od_results;
+//     // 开始计时
+//     gettimeofday(&start, NULL);
+//     ret = inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+//     if (ret != 0)
+//     {
+//         printf("init_yolov8_model fail! ret=%d\n", ret);
+//         goto out;
+//     }
+//     gettimeofday(&end, NULL);
 
-    // 计算耗时（微秒→毫秒）
-    time_use = (end.tv_sec - start.tv_sec) * 1000.0 +
-               (end.tv_usec - start.tv_usec) / 1000.0;
+//     // 计算耗时（微秒→毫秒）
+//     time_use = (end.tv_sec - start.tv_sec) * 1000.0 +
+//                (end.tv_usec - start.tv_usec) / 1000.0;
 
-    printf("inference_yolov8_model 耗时：%.3f ms\n", time_use);
+//     printf("inference_yolov8_model 耗时：%.3f ms\n", time_use);
 
-    // 画框和概率
-    char text[256];
-    for (int i = 0; i < od_results.count; i++)
-    {
-        object_detect_result *det_result = &(od_results.results[i]);
-        printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id),
-               det_result->box.left, det_result->box.top,
-               det_result->box.right, det_result->box.bottom,
-               det_result->prop);
-        int x1 = det_result->box.left;
-        int y1 = det_result->box.top;
-        int x2 = det_result->box.right;
-        int y2 = det_result->box.bottom;
+//     // 画框和概率
+//     char text[256];
+//     for (int i = 0; i < od_results.count; i++)
+//     {
+//         object_detect_result *det_result = &(od_results.results[i]);
+//         printf("%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det_result->cls_id),
+//                det_result->box.left, det_result->box.top,
+//                det_result->box.right, det_result->box.bottom,
+//                det_result->prop);
+//         int x1 = det_result->box.left;
+//         int y1 = det_result->box.top;
+//         int x2 = det_result->box.right;
+//         int y2 = det_result->box.bottom;
 
-        draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
+//         draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
 
-        sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
-        draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
-    }
+//         sprintf(text, "%s %.1f%%", coco_cls_to_name(det_result->cls_id), det_result->prop * 100);
+//         draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
+//     }
 
-    write_image("out1.jpg", &src_image);
+//     write_image("out1.jpg", &src_image);
 
-out:
-    deinit_post_process();
+// out:
+//     deinit_post_process();
 
-    ret = release_yolov8_model(&rknn_app_ctx);
-    if (ret != 0)
-    {
-        printf("release_yolov8_model fail! ret=%d\n", ret);
-    }
+//     ret = release_yolov8_model(&rknn_app_ctx);
+//     if (ret != 0)
+//     {
+//         printf("release_yolov8_model fail! ret=%d\n", ret);
+//     }
 
-    if (src_image.virt_addr != NULL)
-    {
-        free(src_image.virt_addr);
-    }
+//     if (src_image.virt_addr != NULL)
+//     {
+//         free(src_image.virt_addr);
+//     }
 
-    return 0;
-}
+//     return 0;
+// }
 
 /*-------------------------------------------
                 模型精度评估
@@ -442,150 +442,150 @@ out:
 /*-------------------------------------------
                 视频检测
 -------------------------------------------*/
-// #include <stdint.h>
-// #include <stdio.h>
-// #include <stdlib.h>
-// #include <string.h>
-// #include <sys/time.h>
-// #include <dirent.h>
-// #include <algorithm>
-// #include <vector>
-// #include <string>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/time.h>
+#include <dirent.h>
+#include <algorithm>
+#include <vector>
+#include <string>
 
-// #include "yolov8.h"
-// #include "image_utils.h"
-// #include "file_utils.h"
-// #include "image_drawing.h"
+#include "yolov8.h"
+#include "image_utils.h"
+#include "file_utils.h"
+#include "image_drawing.h"
 
-// int endswith(const char *str, const char *suffix)
-// {
-//     if (!str || !suffix)
-//         return 0;
-//     int lenstr = strlen(str);
-//     int lensuffix = strlen(suffix);
-//     if (lensuffix > lenstr)
-//         return 0;
-//     return strncmp(str + lenstr - lensuffix, suffix, lensuffix) == 0;
-// }
+int endswith(const char *str, const char *suffix)
+{
+    if (!str || !suffix)
+        return 0;
+    int lenstr = strlen(str);
+    int lensuffix = strlen(suffix);
+    if (lensuffix > lenstr)
+        return 0;
+    return strncmp(str + lenstr - lensuffix, suffix, lensuffix) == 0;
+}
 
-// int main(int argc, char **argv)
-// {
-//     printf("YOLOv8 video! detection by wyc!!\n");
+int main(int argc, char **argv)
+{
+    printf("YOLOv8 video! detection by wyc!!\n");
 
-//     if (argc != 4)
-//     {
-//         printf("Usage: %s <model_path> <frames_dir> <out_dir>\n", argv[0]);
-//         printf("例如： ffmpeg -i test.mp4 frames/frame_%%06d.jpg\n");
-//         return -1;
-//     }
+    if (argc != 4)
+    {
+        printf("Usage: %s <model_path> <frames_dir> <out_dir>\n", argv[0]);
+        printf("例如： ffmpeg -i test.mp4 frames/frame_%%06d.jpg\n");
+        return -1;
+    }
 
-//     const char *model_path = argv[1];
-//     const char *frames_dir = argv[2];
-//     const char *out_dir = argv[3];
+    const char *model_path = argv[1];
+    const char *frames_dir = argv[2];
+    const char *out_dir = argv[3];
 
-//     // 初始化 YOLO 模型
-//     rknn_app_context_t rknn_app_ctx;
-//     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
+    // 初始化 YOLO 模型
+    rknn_app_context_t rknn_app_ctx;
+    memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
 
-//     init_post_process();
-//     int ret = init_yolov8_model(model_path, &rknn_app_ctx);
-//     if (ret)
-//     {
-//         printf("init_yolov8_model failed!\n");
-//         return -1;
-//     }
+    init_post_process();
+    int ret = init_yolov8_model(model_path, &rknn_app_ctx);
+    if (ret)
+    {
+        printf("init_yolov8_model failed!\n");
+        return -1;
+    }
 
-//     // 创建输出目录（假如不存在）
-//     char cmd[256];
-//     sprintf(cmd, "mkdir -p %s", out_dir);
-//     system(cmd);
+    // 创建输出目录（假如不存在）
+    char cmd[256];
+    sprintf(cmd, "mkdir -p %s", out_dir);
+    system(cmd);
 
-//     // 读取目录中的所有 frame_XXXXXX.jpg 文件
-//     std::vector<std::string> file_list;
-//     DIR *dir = opendir(frames_dir);
-//     struct dirent *entry;
+    // 读取目录中的所有 frame_XXXXXX.jpg 文件
+    std::vector<std::string> file_list;
+    DIR *dir = opendir(frames_dir);
+    struct dirent *entry;
 
-//     while ((entry = readdir(dir)) != NULL)
-//     {
-//         if (endswith(entry->d_name, ".jpg") || endswith(entry->d_name, ".png"))
-//         {
-//             file_list.push_back(entry->d_name);
-//         }
-//     }
-//     closedir(dir);
+    while ((entry = readdir(dir)) != NULL)
+    {
+        if (endswith(entry->d_name, ".jpg") || endswith(entry->d_name, ".png"))
+        {
+            file_list.push_back(entry->d_name);
+        }
+    }
+    closedir(dir);
 
-//     // 按文件名排序（frame_000001.jpg → frame_000002.jpg）
-//     std::sort(file_list.begin(), file_list.end());
+    // 按文件名排序（frame_000001.jpg → frame_000002.jpg）
+    std::sort(file_list.begin(), file_list.end());
 
-//     struct timeval start, end;
-//     double time_use = 0;
+    struct timeval start, end;
+    double time_use = 0;
 
-//     // 🚀 开始逐帧推理
-//     for (size_t i = 0; i < file_list.size(); i++)
-//     {
-//         char img_path[256];
-//         sprintf(img_path, "%s/%s", frames_dir, file_list[i].c_str());
+    // 🚀 开始逐帧推理
+    for (size_t i = 0; i < file_list.size(); i++)
+    {
+        char img_path[256];
+        sprintf(img_path, "%s/%s", frames_dir, file_list[i].c_str());
 
-//         printf("Processing frame: %s\n", img_path);
+        printf("Processing frame: %s\n", img_path);
 
-//         image_buffer_t src_image;
-//         memset(&src_image, 0, sizeof(src_image));
+        image_buffer_t src_image;
+        memset(&src_image, 0, sizeof(src_image));
 
-//         // 读取当前帧
-//         if (read_image(img_path, &src_image) != 0)
-//         {
-//             printf("read_image failed: %s\n", img_path);
-//             continue;
-//         }
+        // 读取当前帧
+        if (read_image(img_path, &src_image) != 0)
+        {
+            printf("read_image failed: %s\n", img_path);
+            continue;
+        }
 
-//         object_detect_result_list od_results; 
+        object_detect_result_list od_results; 
 
-//         gettimeofday(&start, NULL);
-//         inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
-//         gettimeofday(&end, NULL);
+        gettimeofday(&start, NULL);
+        inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+        gettimeofday(&end, NULL);
 
-//         time_use = (end.tv_sec - start.tv_sec) * 1000.0 +
-//                    (end.tv_usec - start.tv_usec) / 1000.0;
+        time_use = (end.tv_sec - start.tv_sec) * 1000.0 +
+                   (end.tv_usec - start.tv_usec) / 1000.0;
 
-//         printf("Frame %s inference time: %.2f ms\n", file_list[i].c_str(), time_use);
+        printf("Frame %s inference time: %.2f ms\n", file_list[i].c_str(), time_use);
 
-//         // draw detection results
-//         char text[256];
-//         for (int j = 0; j < od_results.count; j++)
-//         {
-//             object_detect_result *det = &(od_results.results[j]);
+        // draw detection results
+        char text[256];
+        for (int j = 0; j < od_results.count; j++)
+        {
+            object_detect_result *det = &(od_results.results[j]);
 
-//             int x1 = det->box.left;
-//             int y1 = det->box.top;
-//             int x2 = det->box.right;
-//             int y2 = det->box.bottom;
+            int x1 = det->box.left;
+            int y1 = det->box.top;
+            int x2 = det->box.right;
+            int y2 = det->box.bottom;
 
-//             draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
+            draw_rectangle(&src_image, x1, y1, x2 - x1, y2 - y1, COLOR_BLUE, 3);
             
 
-//             sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
-//             if (strncmp(text, "ball", 4) == 0)
-//             {
-//                 draw_rectangle(&src_image, x1, y1, (x2 - x1) * 2, (y2 - y1) * 2, COLOR_GREEN, 3);
-//             }
+            // sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
+            // if (strncmp(text, "ball", 4) == 0)
+            // {
+            //     draw_rectangle(&src_image, x1, y1, (x2 - x1) * 2, (y2 - y1) * 2, COLOR_GREEN, 3);
+            // }
             
-//             draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
-//         }
+            //draw_text(&src_image, text, x1, y1 - 20, COLOR_RED, 10);
+        }
 
-//         // 保存输出帧
-//         char out_path[256];
-//         sprintf(out_path, "%s/%s", out_dir, file_list[i].c_str());
-//         write_image(out_path, &src_image);
+        // 保存输出帧
+        char out_path[256];
+        sprintf(out_path, "%s/%s", out_dir, file_list[i].c_str());
+        write_image(out_path, &src_image);
 
-//         free(src_image.virt_addr);
-//     }
+        free(src_image.virt_addr);
+    }
 
-//     // 清理
-//     deinit_post_process();
-//     release_yolov8_model(&rknn_app_ctx);
+    // 清理
+    deinit_post_process();
+    release_yolov8_model(&rknn_app_ctx);
 
-//     printf("All frames processed. Now use ffmpeg to combine them:\n");
-//     printf("ffmpeg -r 30 -i %s/frame_%%06d.jpg -vcodec libx264 -pix_fmt yuv420p result.mp4\n", out_dir);
+    printf("All frames processed. Now use ffmpeg to combine them:\n");
+    printf("ffmpeg -r 30 -i %s/frame_%%06d.jpg -vcodec libx264 -pix_fmt yuv420p result.mp4\n", out_dir);
 
-//     return 0;
-// }
+    return 0;
+}

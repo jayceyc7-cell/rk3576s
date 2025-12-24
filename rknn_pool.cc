@@ -41,7 +41,7 @@ void RknnPool::DeInit() { deinit_post_process(); }
 
 void RknnPool::AddInferenceTask(std::shared_ptr<image_buffer_t> src, std::string txt_path) {
   pool_->enqueue(
-      [&](std::shared_ptr<image_buffer_t> original_img) {
+      [&](std::shared_ptr<image_buffer_t> original_img, std::string txt_path) {
         auto od_results = std::make_shared<object_detect_result_list>();
         auto mode_id = get_model_id();
         int ret = inference_yolov8_model(
@@ -61,7 +61,7 @@ void RknnPool::AddInferenceTask(std::shared_ptr<image_buffer_t> src, std::string
         std::lock_guard<std::mutex> lock_guard(this->image_results_mutex_);
         this->image_results_.push(output);
       },
-      std::move(src));
+      std::move(src), txt_path);
 }
 
 int RknnPool::get_model_id() {
@@ -93,4 +93,30 @@ Output::Output(std::shared_ptr<image_buffer_t> im, std::shared_ptr<object_detect
     this->img = im;
     this->result = re;
     this->txt_path = txt_pa;
+}
+
+Output::~Output()
+{
+    // 1. 释放图片内存（最关键）
+    if (img) {
+        // 释放虚拟地址
+        if (img->virt_addr) {
+            free(img->virt_addr);
+            img->virt_addr = nullptr;
+        }
+
+        // 清空 image_buffer_t 里的元信息
+        img->width = 0;
+        img->height = 0;
+        img->width_stride = 0;
+        img->height_stride = 0;
+        img->size = 0;
+    }
+
+    // 2. 释放 shared_ptr 持有的对象
+    img.reset();
+    result.reset();
+
+    // 3. 清空路径字符串
+    txt_path.clear();
 }
