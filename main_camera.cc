@@ -150,7 +150,7 @@ int main(int argc, char **argv)
                    (end.tv_usec - start.tv_usec) / 1000.0;
 
         printf("Frame %s inference time: %.2f ms\n", file_list[i].c_str(), time_use);
-
+        printf ("src_image.format = %d\n",src_image.format);
         // draw detection results
         char text[256];
         for (int j = 0; j < od_results.count; j++)
@@ -190,6 +190,14 @@ int main(int argc, char **argv)
         tracker.ProcessFrame(i, src_image, detections, track_results);
 
         /******************球的跟踪预测出口*********************/
+
+        /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
+
+        if (track_results.size() > 0)
+        {
+            draw_rectangle(&src_image, track_results[0].xmin, track_results[0].ymin, track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin, COLOR_YELLOW, 3);
+            // draw_text(&src_image, text, track_results[0].xmin, track_results[0].ymin - 20, COLOR_RED, 10);
+        }
 
         // 保存输出帧
         char out_path[256];

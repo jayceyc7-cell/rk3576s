@@ -9,7 +9,9 @@
 
 // ======================= 参数配置 =======================
 static constexpr int   MAX_MISS_COUNT = 2;
-
+static const float GATE_THRESHOLD = 200.0f;
+BallTrack *g_ball_ = nullptr; // 使用指针保持全局状态（多帧间保持滤波状态）
+int miss_count_ = 0;             // 连续未匹配帧数
 
 TrackFrame::TrackFrame() {
     std::cout << "TrackFrame!!!" << std::endl;
@@ -50,9 +52,7 @@ void TrackFrame::DeInit()
     max_track_num_ = 0;
 }
 
-BallTrack *g_ball_ = nullptr; // 使用指针保持全局状态（多帧间保持滤波状态）
-int miss_count_ = 0;             // 连续未匹配帧数
-const T_DetectObject* ball_det = nullptr;
+
 void TrackFrame::ProcessFrame(
     uint64_t frame_id,
     image_buffer_t& src_image,
@@ -62,11 +62,11 @@ void TrackFrame::ProcessFrame(
     printf("[ProcessFrame] frame_id=%lu, det_num=%zu\n",
            frame_id, detections.size());
 
-    const float GATE_THRESHOLD = 200.0f;
     track_results.clear();
 
     // =====================================================
     // 1. 只筛选 cls_id == 0（篮球） 
+    // 2025-12-25:在篮球的筛选中，可能检测到多个篮球，此时为每一个篮球都创建一个轨迹，而后对每一个轨迹放入筛选器筛选，筛选器主要作用是筛选出需要跟踪的主篮球轨迹，干扰篮球轨迹需要删除。
     // =====================================================
     const T_DetectObject* ball_det = nullptr;
     for (const auto& det : detections)
@@ -210,6 +210,15 @@ void TrackFrame::ProcessFrame(
     float pred_ymin = pred[1];
     float pred_w    = pred[2];
     float pred_h    = pred[3];
+    //更新轨迹
+    T_TrackObject track;
+    track.track_id = 0; //篮球轨迹id，暂时取第一个，多个轨迹时需要修改id号
+    track.cls_id = 0; // 篮球类别的id为0
+    track.xmin = pred[0];
+    track.ymin = pred[1];
+    track.xmax = pred[0] + pred[2];
+    track.ymax = pred[1] + pred[3];
+    track_results.push_back(track);
 
     draw_rectangle(&src_image,
                    pred_xmin, pred_ymin,
