@@ -8,9 +8,8 @@
 
 
 // ======================= 参数配置 =======================
-static constexpr int   MAX_MISS_COUNT = 30;
-#define CROP_W 800
-#define CROP_H 640
+static constexpr int   MAX_MISS_COUNT = 2;
+
 
 TrackFrame::TrackFrame() {
     std::cout << "TrackFrame!!!" << std::endl;
@@ -60,13 +59,14 @@ void TrackFrame::ProcessFrame(
     const std::vector<T_DetectObject>& detections,
     std::vector<T_TrackObject>& track_results)
 {
-    printf("\n[ProcessFrame] frame_id=%lu, det_num=%zu\n",
+    printf("[ProcessFrame] frame_id=%lu, det_num=%zu\n",
            frame_id, detections.size());
 
+    const float GATE_THRESHOLD = 200.0f;
     track_results.clear();
 
     // =====================================================
-    // 1. 只筛选 cls_id == 0（篮球）
+    // 1. 只筛选 cls_id == 0（篮球） 
     // =====================================================
     const T_DetectObject* ball_det = nullptr;
     for (const auto& det : detections)
@@ -160,8 +160,11 @@ void TrackFrame::ProcessFrame(
 
     float dist = maha(0);
     printf("[GATE] Mahalanobis distance = %.2f\n", dist);
-
-    const float GATE_THRESHOLD = 200.0f;
+    // 构造要显示的文本
+    char text_buf[128];
+    snprintf(text_buf, sizeof(text_buf),
+             "Dist: %.2f  Miss: %d",
+             dist, miss_count_);
 
     // =====================================================
     // 6. update 或 miss
@@ -170,12 +173,31 @@ void TrackFrame::ProcessFrame(
     {
         g_ball_->update(g_kf, tlwh);
         miss_count_ = 0;
-        printf("[UPDATE] matched\n");
+        draw_text(&src_image,
+                  text_buf,
+                  10, 40,
+                  COLOR_YELLOW, 20);
+
+        draw_text(&src_image,
+                  "[Update MATCH]",
+                  10, 80,
+                  COLOR_YELLOW, 20);
     }
     else
     {
         miss_count_++;
-        printf("[MISS] miss_count=%d\n", miss_count_);
+        snprintf(text_buf, sizeof(text_buf),
+                 "Dist: %.2f  Miss: %d",
+                 dist, miss_count_);
+        draw_text(&src_image,
+                  text_buf,
+                  10, 40,
+                  COLOR_YELLOW, 20);
+
+        draw_text(&src_image,
+                  "[Update MATCH]",
+                  10, 80,
+                  COLOR_YELLOW, 20);
     }
 
     // =====================================================
@@ -196,6 +218,11 @@ void TrackFrame::ProcessFrame(
 
     printf("[PREDICT] x=%.2f y=%.2f w=%.2f h=%.2f\n",
            pred_xmin, pred_ymin, pred_w, pred_h);
+    
+    draw_text(&src_image,
+              "BallTrack info:",
+              10, 10,
+              COLOR_YELLOW, 20);
 
     // =====================================================
     // 8. 连续丢失 → reset
