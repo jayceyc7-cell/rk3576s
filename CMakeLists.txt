@@ -60,13 +60,14 @@ set(CMAKE_INSTALL_RPATH "$ORIGIN/../lib")
 file(GLOB SRCS ${CMAKE_CURRENT_SOURCE_DIR}/*.cc)
 
 add_executable(${PROJECT_NAME}
-    main_camera.cc
+    main_process.cc
     postprocess.cc
     rknn_pool.cc
     awi_track.cpp
     BallTrack.cpp
     kalmanFilter.cpp
     STrack.cpp
+    image_utils.c
     ${rknpu_yolov8_file}
 )
 
@@ -101,7 +102,12 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 if (NOT (TARGET_SOC STREQUAL "rv1106" OR TARGET_SOC STREQUAL "rv1103" OR TARGET_SOC STREQUAL "rk1808" 
     OR TARGET_SOC STREQUAL "rv1109" OR TARGET_SOC STREQUAL "rv1126" OR TARGET_SOC STREQUAL "rv1103b"))
     add_executable(${PROJECT_NAME}_zero_copy
-        main.cc
+        main_process.cc
+        awi_track.cpp
+        BallTrack.cpp
+        kalmanFilter.cpp
+        STrack.cpp
+        image_utils.c
         postprocess.cc
         rknn_pool.cc
         rknpu2/yolov8_zero_copy.cc
