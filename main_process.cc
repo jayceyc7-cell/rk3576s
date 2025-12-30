@@ -870,6 +870,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             printf("*裁剪: %d x %d, use time: %.2f ms\n", crop_width, crop_height, time_use);
         }else{
             //不裁剪，使用全图
+            printf("*不裁剪，使用全图\n");
             crop_image = src_image;
         }
         // === 推理 / 处理 ===
@@ -955,7 +956,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                     obj_rect.right = det->box.right + crop_rect.left;
                     obj_rect.bottom = det->box.bottom + crop_rect.top;
                 }               
-                need_crop = true;
+                //need_crop = true;
                 break;
             } 
             printf("need crop = %d\n", need_crop);
@@ -1031,8 +1032,13 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
 
         char out_path[256];
         sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
-        write_image(out_path, &save_image);
+        write_image(out_path, &crop_image);
         frame_count++;
+        // === 回收 ===
+        src_image = crop_image;
+        pool.release(src_image);
+        memset(&src_image, 0, sizeof(image_buffer_t));
+             
     }
 
     // 清理
