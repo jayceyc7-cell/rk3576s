@@ -514,117 +514,7 @@ void print_int8_tensor(int8_t* data, int size, int N)
     }
     printf("\n");
 }
-// ===== NC1HWC2 layout access =====
-// static inline float get_nc1hwc2_fp32(
-//     const float* base,
-//     int c, int h, int w,
-//     int H, int W)
-// {
-//     int c1 = c >> 1;
-//     int c2 = c & 1;
-//     int idx = (((c1 * H + h) * W + w) << 1) + c2;
-//     return base[idx];
-// }
-// int post_process_nc1hwc2(
-//     rknn_app_context_t* app_ctx,
-//     letterbox_t* letter_box,
-//     float conf_threshold,
-//     float nms_threshold,
-//     object_detect_result_list* od_results)
-// {
-//     memset(od_results, 0, sizeof(object_detect_result_list));
 
-//     std::vector<float> filterBoxes;
-//     std::vector<float> objProbs;
-//     std::vector<int>   classId;
-
-//     int model_in_w = app_ctx->model_width;
-//     int model_in_h = app_ctx->model_height;
-
-//     int output_per_branch = app_ctx->io_num.n_output / 3;
-//     int dfl_len = app_ctx->output_attrs[0].dims[1] / 4;
-
-//     int validCount = 0;
-
-//     /* ---------- 3 个 YOLO 分支 ---------- */
-//     for (int i = 0; i < 3; i++)
-//     {
-//         int box_idx = i * output_per_branch;
-//         int cls_idx = i * output_per_branch + 1;
-//         int obj_idx = (output_per_branch == 3) ?
-//                       (i * output_per_branch + 2) : -1;
-
-//         int grid_h = app_ctx->output_attrs[box_idx].dims[2];
-//         int grid_w = app_ctx->output_attrs[box_idx].dims[3];
-//         int stride = model_in_h / grid_h;
-
-//         const float* box_ptr =
-//             (const float*)app_ctx->output_mems[box_idx]->virt_addr;
-//         const float* cls_ptr =
-//             (const float*)app_ctx->output_mems[cls_idx]->virt_addr;
-//         const float* obj_ptr =
-//             (obj_idx >= 0) ?
-//             (const float*)app_ctx->output_mems[obj_idx]->virt_addr :
-//             nullptr;
-
-//         validCount += process_fp32_nc1hwc2(
-//             box_ptr,
-//             cls_ptr,
-//             obj_ptr,
-//             grid_h,
-//             grid_w,
-//             stride,
-//             dfl_len,
-//             filterBoxes,
-//             objProbs,
-//             classId,
-//             conf_threshold);
-//     }
-
-//     if (validCount <= 0)
-//         return 0;
-
-//     /* ---------- sort ---------- */
-//     std::vector<int> indexArray(validCount);
-//     for (int i = 0; i < validCount; ++i)
-//         indexArray[i] = i;
-
-//     quick_sort_indice_inverse(objProbs, 0, validCount - 1, indexArray);
-
-//     /* ---------- nms ---------- */
-//     std::set<int> class_set(classId.begin(), classId.end());
-//     for (int c : class_set)
-//         nms(validCount, filterBoxes, classId, indexArray, c, nms_threshold);
-
-//     /* ---------- decode to output ---------- */
-//     int last_count = 0;
-//     for (int i = 0; i < validCount && last_count < OBJ_NUMB_MAX_SIZE; ++i)
-//     {
-//         int n = indexArray[i];
-//         if (n < 0) continue;
-
-//         float x1 = filterBoxes[n * 4 + 0] - letter_box->x_pad;
-//         float y1 = filterBoxes[n * 4 + 1] - letter_box->y_pad;
-//         float x2 = x1 + filterBoxes[n * 4 + 2];
-//         float y2 = y1 + filterBoxes[n * 4 + 3];
-
-//         od_results->results[last_count].box.left =
-//             (int)(clamp(x1, 0, model_in_w) / letter_box->scale);
-//         od_results->results[last_count].box.top =
-//             (int)(clamp(y1, 0, model_in_h) / letter_box->scale);
-//         od_results->results[last_count].box.right =
-//             (int)(clamp(x2, 0, model_in_w) / letter_box->scale);
-//         od_results->results[last_count].box.bottom =
-//             (int)(clamp(y2, 0, model_in_h) / letter_box->scale);
-
-//         od_results->results[last_count].prop = objProbs[i];
-//         od_results->results[last_count].cls_id = classId[n];
-//         last_count++;
-//     }
-
-//     od_results->count = last_count;
-//     return 0;
-// }
 
 int post_process(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, object_detect_result_list *od_results)
 {
@@ -651,47 +541,104 @@ int post_process(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter
 
     //**************************/
 
-    for (int i = 0; i < 3; i++)
+    int num_heads = app_ctx->io_num.n_output / 3;
+
+    if (app_ctx->io_num.n_output % 3 != 0)
     {
+        printf("[ERROR] Invalid YOLO output layout: n_output=%d\n",
+               app_ctx->io_num.n_output);
+        return -1;
+    }
+
+    for (int i = 0; i < num_heads; i++)
+    {
+        int box_idx = i * 3;
+        int score_idx = i * 3 + 1;
+        int cls_idx = i * 3 + 2;
 
         void *score_sum = nullptr;
         int32_t score_sum_zp = 0;
-        float score_sum_scale = 1.0;
-        if (output_per_branch == 3)
-        {
-            score_sum = _outputs[i * output_per_branch + 2].buf;
-            score_sum_zp = app_ctx->output_attrs[i * output_per_branch + 2].zp;
-            score_sum_scale = app_ctx->output_attrs[i * output_per_branch + 2].scale;
-        }
-        int box_idx = i * output_per_branch;
-        int score_idx = i * output_per_branch + 1;
+        float score_sum_scale = 1.0f;
+
+        score_sum = _outputs[cls_idx].buf;
+        score_sum_zp = app_ctx->output_attrs[cls_idx].zp;
+        score_sum_scale = app_ctx->output_attrs[cls_idx].scale;
 
         grid_h = app_ctx->output_attrs[box_idx].dims[2];
         grid_w = app_ctx->output_attrs[box_idx].dims[3];
-
         stride = model_in_h / grid_h;
+
         printf("grid_h %d, grid_w %d, stride %d\n", grid_h, grid_w, stride);
 
         if (app_ctx->is_quant)
         {
-            // int8_t* data = (int8_t *)_outputs[box_idx].buf;
-            // print_int8_tensor(data, 10, 10);
-            // printf("size_box %d, size_score %d\n", app_ctx->output_attrs[box_idx].size, app_ctx->output_attrs[score_idx].size);
-            // printf("dim_box %d, dim_score %d\n", app_ctx->output_attrs[box_idx].n_dims, app_ctx->output_attrs[score_idx].n_dims);
-            validCount += process_i8((int8_t *)_outputs[box_idx].buf, app_ctx->output_attrs[box_idx].zp, app_ctx->output_attrs[box_idx].scale,
-                                     (int8_t *)_outputs[score_idx].buf, app_ctx->output_attrs[score_idx].zp, app_ctx->output_attrs[score_idx].scale,
-                                     (int8_t *)score_sum, score_sum_zp, score_sum_scale,
-                                     grid_h, grid_w, stride, dfl_len,
-                                     filterBoxes, objProbs, classId, conf_threshold);
+            validCount += process_i8(
+                (int8_t *)_outputs[box_idx].buf,
+                app_ctx->output_attrs[box_idx].zp,
+                app_ctx->output_attrs[box_idx].scale,
+                (int8_t *)_outputs[score_idx].buf,
+                app_ctx->output_attrs[score_idx].zp,
+                app_ctx->output_attrs[score_idx].scale,
+                (int8_t *)score_sum,
+                score_sum_zp,
+                score_sum_scale,
+                grid_h, grid_w, stride, dfl_len,
+                filterBoxes, objProbs, classId,
+                conf_threshold);
         }
         else
         {
-            validCount += process_fp32((float *)_outputs[box_idx].buf, (float *)_outputs[score_idx].buf, (float *)score_sum,
-                                       grid_h, grid_w, stride, dfl_len,
-                                       filterBoxes, objProbs, classId, conf_threshold);
+            validCount += process_fp32(
+                (float *)_outputs[box_idx].buf,
+                (float *)_outputs[score_idx].buf,
+                (float *)score_sum,
+                grid_h, grid_w, stride, dfl_len,
+                filterBoxes, objProbs, classId,
+                conf_threshold);
         }
-
     }
+
+    // for (int i = 0; i < 3; i++)
+    // {
+
+    //     void *score_sum = nullptr;
+    //     int32_t score_sum_zp = 0;
+    //     float score_sum_scale = 1.0;
+    //     if (output_per_branch == 3)
+    //     {
+    //         score_sum = _outputs[i * output_per_branch + 2].buf;
+    //         score_sum_zp = app_ctx->output_attrs[i * output_per_branch + 2].zp;
+    //         score_sum_scale = app_ctx->output_attrs[i * output_per_branch + 2].scale;
+    //     }
+    //     int box_idx = i * output_per_branch;
+    //     int score_idx = i * output_per_branch + 1;
+
+    //     grid_h = app_ctx->output_attrs[box_idx].dims[2];
+    //     grid_w = app_ctx->output_attrs[box_idx].dims[3];
+
+    //     stride = model_in_h / grid_h;
+    //     printf("grid_h %d, grid_w %d, stride %d\n", grid_h, grid_w, stride);
+
+    //     if (app_ctx->is_quant)
+    //     {
+    //         // int8_t* data = (int8_t *)_outputs[box_idx].buf;
+    //         // print_int8_tensor(data, 10, 10);
+    //         // printf("size_box %d, size_score %d\n", app_ctx->output_attrs[box_idx].size, app_ctx->output_attrs[score_idx].size);
+    //         // printf("dim_box %d, dim_score %d\n", app_ctx->output_attrs[box_idx].n_dims, app_ctx->output_attrs[score_idx].n_dims);
+    //         validCount += process_i8((int8_t *)_outputs[box_idx].buf, app_ctx->output_attrs[box_idx].zp, app_ctx->output_attrs[box_idx].scale,
+    //                                  (int8_t *)_outputs[score_idx].buf, app_ctx->output_attrs[score_idx].zp, app_ctx->output_attrs[score_idx].scale,
+    //                                  (int8_t *)score_sum, score_sum_zp, score_sum_scale,
+    //                                  grid_h, grid_w, stride, dfl_len,
+    //                                  filterBoxes, objProbs, classId, conf_threshold);
+    //     }
+    //     else
+    //     {
+    //         validCount += process_fp32((float *)_outputs[box_idx].buf, (float *)_outputs[score_idx].buf, (float *)score_sum,
+    //                                    grid_h, grid_w, stride, dfl_len,
+    //                                    filterBoxes, objProbs, classId, conf_threshold);
+    //     }
+
+    // }
 
 
     // no object detect

@@ -106,136 +106,146 @@ class crop_window
 public:
     // 初始化裁切窗口信息
     crop_window(int x, int y, int w, int h)
-        : x_(x), y_(y), w_(w), h_(h) {}
+        : default_x_(x), default_y_(y), default_w_(w), default_h_(h) {}
 
     // 裁切窗口
     void get_crop_window(image_buffer_t* src_image, image_buffer_t* crop_image)
     {
+        printf("get_crop_window\n");
         if (is_cropping)
         {
             // 裁剪
-            crop_alg_image(src_image, crop_image, obj_rect, &crop_rect, ALG_CROP_WIDTH, ALG_CROP_HEIGHT); 
             printf("*裁剪\n");
+            crop_alg_image(src_image, crop_image, obj_rect, &crop_rect, ALG_CROP_WIDTH, ALG_CROP_HEIGHT); 
         }
         else
         {
             // 不裁剪，使用全图
             printf("*不裁剪，使用全图\n");
-            crop_image = src_image;
+            *crop_image = *src_image;
         }
+        // 重置裁切标志
+        is_cropping = false;
     }
     // 更新裁切窗口信息
-    void update_crop_window(float xmin, float ymin, float xmax, float ymax)
+    void update_crop_window(image_buffer_t* crop_image, float xmin, float ymin, float xmax, float ymax)
     {
-        is_cropping = true;
+        printf("update_crop_window\n");
+        //测试阶段都置false
+        is_cropping = false;
         // 更新裁切窗口
         obj_rect.left = xmin;
         obj_rect.top = ymin;
-        obj_rect.right = xmax;
-        obj_rect.bottom = ymax;
+        obj_rect.right = xmax - xmin;
+        obj_rect.bottom = ymax - ymin;
+
+
+
+        //画红色裁剪框
+        draw_rectangle(crop_image, obj_rect.left, obj_rect.top, ALG_CROP_WIDTH, ALG_CROP_HEIGHT, COLOR_RED, 3);
+
+
         /// 检测不到目标处理
-        if (!first_frame && (od_results.count == 0 || j == od_results.count))
-        {
-            need_crop = false;
-            if (crop_image.width != PIC_FULL_WIDTH || crop_image.height != PIC_FULL_HEIGHT)
-            {
-                // 逐步放大裁剪区域
-                printf("***扩大裁剪区域: %d x %d\n", PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
-                if (crop_image.virt_addr != NULL)
-                {
-                    free(crop_image.virt_addr);
-                    memset(&crop_image, 0, sizeof(image_buffer_t));
-                }
-                continue;
-            }
-            else
-            {
-                printf("***全图也检测不到\n");
-                // 保存上次写入的输出帧（后续可以连续前三帧检测不到使用之前的数据，否则从全景图裁剪）
-                crop_width = ALG_CROP_WIDTH;
-                crop_height = ALG_CROP_HEIGHT;
-                crop_alg_image(&src_image, &save_image, last_obj_rect, &crop_rect, crop_width, crop_height);
-                char out_path[256];
-                sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
-                write_image(out_path, &save_image);
-                frame_count++;
-                if (save_image.virt_addr != NULL)
-                {
-                    free(save_image.virt_addr);
-                    memset(&save_image, 0, sizeof(image_buffer_t));
-                }
+        // if (!first_frame && (od_results.count == 0 || j == od_results.count))
+        // {
+        //     need_crop = false;
+        //     if (crop_image.width != PIC_FULL_WIDTH || crop_image.height != PIC_FULL_HEIGHT)
+        //     {
+        //         // 逐步放大裁剪区域
+        //         printf("***扩大裁剪区域: %d x %d\n", PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
+        //         if (crop_image.virt_addr != NULL)
+        //         {
+        //             free(crop_image.virt_addr);
+        //             memset(&crop_image, 0, sizeof(image_buffer_t));
+        //         }
+        //         continue;
+        //     }
+        //     else
+        //     {
+        //         printf("***全图也检测不到\n");
+        //         // 保存上次写入的输出帧（后续可以连续前三帧检测不到使用之前的数据，否则从全景图裁剪）
+        //         crop_width = ALG_CROP_WIDTH;
+        //         crop_height = ALG_CROP_HEIGHT;
+        //         crop_alg_image(&src_image, &save_image, last_obj_rect, &crop_rect, crop_width, crop_height);
+        //         char out_path[256];
+        //         sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
+        //         write_image(out_path, &save_image);
+        //         frame_count++;
+        //         if (save_image.virt_addr != NULL)
+        //         {
+        //             free(save_image.virt_addr);
+        //             memset(&save_image, 0, sizeof(image_buffer_t));
+        //         }
 
-                // === 回收 ===
-                pool.release(src_image);
-                memset(&src_image, 0, sizeof(image_buffer_t));
-                continue;
-            }
-        }
+        //         // === 回收 ===
+        //         pool.release(src_image);
+        //         memset(&src_image, 0, sizeof(image_buffer_t));
+        //         continue;
+        //     }
+        // }
         /// 检测目标处理
-        if (first_frame || need_crop)
-        {
-            printf("*save to file...\n");
-            // 保存输出帧
+        // if (first_frame || need_crop)
+        // {
+        //     printf("*save to file...\n");
+        //     // 保存输出帧
 
-            if (need_crop)
-            {
-                if (crop_image.width == PIC_FULL_WIDTH && crop_image.height == PIC_FULL_HEIGHT)
-                {
-                    crop_width = ALG_CROP_WIDTH;
-                    crop_height = ALG_CROP_HEIGHT;
-                    crop_alg_image(&crop_image, &save_image, obj_rect, &crop_rect, crop_width, crop_height); // 差不多要10ms;
-                    crop_image = save_image;
-                }
-                else
-                {
-                    save_image = crop_image;
-                }
-                last_obj_rect = obj_rect;
-            }
+        //     if (need_crop)
+        //     {
+        //         if (crop_image.width == PIC_FULL_WIDTH && crop_image.height == PIC_FULL_HEIGHT)
+        //         {
+        //             crop_width = ALG_CROP_WIDTH;
+        //             crop_height = ALG_CROP_HEIGHT;
+        //             crop_alg_image(&crop_image, &save_image, obj_rect, &crop_rect, crop_width, crop_height); // 差不多要10ms;
+        //             crop_image = save_image;
+        //         }
+        //         else
+        //         {
+        //             save_image = crop_image;
+        //         }
+        //         last_obj_rect = obj_rect;
+        //     }
 
-            char out_path[256];
-            sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
-            write_image(out_path, &crop_image);
-            frame_count++;
+        //     char out_path[256];
+        //     sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
+        //     write_image(out_path, &crop_image);
+        //     frame_count++;
 
-            if (save_image.virt_addr != NULL)
-            {
-                free(save_image.virt_addr);
-                memset(&save_image, 0, sizeof(image_buffer_t));
-            }
+        //     if (save_image.virt_addr != NULL)
+        //     {
+        //         free(save_image.virt_addr);
+        //         memset(&save_image, 0, sizeof(image_buffer_t));
+        //     }
 
-            // === 回收 ===
-            pool.release(src_image);
-            memset(&src_image, 0, sizeof(image_buffer_t));
+        //     // === 回收 ===
+        //     pool.release(src_image);
+        //     memset(&src_image, 0, sizeof(image_buffer_t));
 
-            if (first_frame && need_crop)
-            {
-                first_frame = false;
-            }
-        }
+        //     if (first_frame && need_crop)
+        //     {
+        //         first_frame = false;
+        //     }
+        // }
     }
     // 重置裁切窗口信息
     void reset_crop_window()
     {
-        x_ = default_x_;
-        y_ = default_y_;
-        w_ = default_w_;
-        h_ = default_h_;
+        // x_ = default_x_;
+        // y_ = default_y_;
+        // w_ = default_w_;
+        // h_ = default_h_;
     }
 private:
     bool is_cropping = false;
-    int default_x_ = x_;
-    int default_y_ = y_;
-    int default_w_ = w_;
-    int default_h_ = h_;
-    int x_;
-    int y_;
-    int w_;
-    int h_;
-    image_buffer_t crop_image = {0};
-    image_buffer_t src_image = {0};
-    image_rect_t obj_rect = {0};
-    image_rect_t crop_rect = {0};
+
+    int default_x_;
+    int default_y_;
+    int default_w_;
+    int default_h_;
+
+    image_buffer_t crop_image = {0};   //存放裁剪后的图像信息
+    image_buffer_t src_image = {0};    //存放图像信息
+    image_rect_t obj_rect = {0};       //存放检测到的目标框
+    image_rect_t crop_rect = {0};      //存放裁剪框
 
 };
 
@@ -383,7 +393,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     image_buffer_t save_image = {0};
     image_buffer_t crop_image = {0};
 
-    int crop_width = ALG_CROP_WIDTH;;
+    int crop_width = ALG_CROP_WIDTH;
     int crop_height = ALG_CROP_HEIGHT;
 
     TrackFrame tracker;
@@ -463,22 +473,24 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                 tracker.ProcessFrame(frame_track_count, crop_image, detections, track_results);
 
                 /******************球的跟踪预测出口*********************/
-
-                /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
-
+                printf("track_results.size() = %d\n", track_results.size());
                 if (track_results.size() > 0)
                 {
-                    draw_rectangle(&crop_image, track_results[0].xmin, track_results[0].ymin, track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin, COLOR_GREEN, 3);
+                    printf("draw_rectangle @ (%d %d %d %d)\n", track_results[0].xmin, track_results[0].ymin, track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin);
+                    draw_rectangle(&crop_image, track_results[0].xmin, track_results[0].ymin, 
+                        track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin, COLOR_GREEN, 3);
+                    
+                        /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
+                        // 更新裁切窗口
+                    crop_win.update_crop_window(&crop_image, track_results[0].xmin, track_results[0].ymin, track_results[0].xmax, track_results[0].ymax);
                 }
+
+                // 这个break是测试下用的
                 break;
             } 
         }
-
-        // 更新裁切窗口
-        crop_win.update_crop_window(track_results[0].xmin, track_results[0].ymin, track_results[0].xmax, track_results[0].ymax);
-
-
-        //保存裁切结果输出
+        printf("*保存结果输出\n");
+        //保存结果输出
         char out_path[256];
         sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
         write_image(out_path, &crop_image);
