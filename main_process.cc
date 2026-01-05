@@ -118,6 +118,11 @@ public:
         update_rect();
     }
 
+    const image_rect_t &get_rect() const
+    {
+        return rect_;
+    }
+
     // 每一帧调用：画框 + 裁剪
     void get_crop_window(image_buffer_t* src, image_buffer_t* dst)
     {
@@ -158,8 +163,8 @@ private:
     image_rect_t rect_;
 
     // ================= 调参区（非常重要） =================
-    const float alpha_ = 0.03f;       // 平滑系数（0.15~0.3 推荐）
-    const float dead_zone_px_ = 500.0f; // 死区像素（5~15）
+    const float alpha_ = 0.05f;       // 平滑系数（0.15~0.3 推荐）
+    const float dead_zone_px_ = 200.0f; // 死区像素（5~15）
 
 private:
     // 根据中心更新裁剪框
@@ -217,39 +222,39 @@ private:
     }
 
     // 实际裁剪（你工程里换回 image_crop 即可）
-    void crop_image(image_buffer_t* src, image_buffer_t* dst)
-    {
-        // 正式版本：
-        // image_crop(src, dst, rect_);
-
-        // 临时占位（调试）
-        *dst = *src;
-    }
-    // void crop_image(image_buffer_t *src, image_buffer_t *dst)
+    // void crop_image(image_buffer_t* src, image_buffer_t* dst)
     // {
-    //     if (!src || !dst)
-    //         return;
+    //     // 正式版本：
+    //     // image_crop(src, dst, rect_);
 
-    //     // 1. 使用跟踪得到的裁剪框
-    //     image_rect_t box = rect_;
-
-    //     // 2. 实际裁剪后在 src 中使用的区域（调试用）
-    //     image_rect_t real_crop_rect;
-
-    //     // 3. 调用你已经实现好的裁剪算法
-    //     int ret = crop_alg_image(
-    //         src,
-    //         dst,
-    //         box,
-    //         &real_crop_rect,
-    //         ALG_CROP_WIDTH,
-    //         ALG_CROP_HEIGHT);
-
-    //     if (ret != 0)
-    //     {
-    //         printf("crop_alg_image failed, ret=%d\n", ret);
-    //     }
+    //     // 临时占位（调试）
+    //     *dst = *src;
     // }
+    void crop_image(image_buffer_t *src, image_buffer_t *dst)
+    {
+        if (!src || !dst)
+            return;
+
+        // 1. 使用跟踪得到的裁剪框
+        image_rect_t box = rect_;
+
+        // 2. 实际裁剪后在 src 中使用的区域（调试用）
+        image_rect_t real_crop_rect;
+
+        // 3. 调用你已经实现好的裁剪算法
+        int ret = crop_alg_image(
+            src,
+            dst,
+            box,
+            &real_crop_rect,
+            ALG_CROP_WIDTH,
+            ALG_CROP_HEIGHT);
+
+        if (ret != 0)
+        {
+            printf("crop_alg_image failed, ret=%d\n", ret);
+        }
+    }
 };
 
 
@@ -489,11 +494,16 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
 
                     /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
                     // 更新裁切窗口
-                    crop_win.update_by_target(
-                        track_results[0].xmin,
-                        track_results[0].ymin,
-                        track_results[0].xmax,
-                        track_results[0].ymax);
+                    auto &t = track_results[0];
+
+                    // 裁剪图 → 原图坐标
+                    int oxmin = crop_win.get_rect().left + t.xmin;
+                    int oymin = crop_win.get_rect().top + t.ymin;
+                    int oxmax = crop_win.get_rect().left + t.xmax;
+                    int oymax = crop_win.get_rect().top + t.ymax;
+
+                    // 用“原图坐标”更新裁剪窗口
+                    crop_win.update_by_target(oxmin, oymin, oxmax, oymax);
                 }
 
                 // 这个break是测试下用的
@@ -508,8 +518,14 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
         write_image(out_path, &crop_image);
         frame_count++;
+        // ===== 释放裁剪图内存=====
+        if (crop_image.virt_addr)
+        {
+            free(crop_image.virt_addr);
+            crop_image.virt_addr = NULL;
+        }
         // === 回收 ===
-        src_image = crop_image;
+        // src_image = crop_image;
         pool.release(src_image);
         memset(&src_image, 0, sizeof(image_buffer_t));
              
