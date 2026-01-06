@@ -130,6 +130,15 @@ public:
         crop_image(src, dst);
     }
 
+    void reset_to_center()
+    {
+        cx_ = img_w_ * 0.5f;
+        cy_ = img_h_ * 0.5f;
+        target_cx_ = cx_;
+        target_cy_ = cy_;
+        update_rect();
+    }
+
     // 仅在“检测 / 跟踪到目标”时调用
     void update_by_target(int xmin, int ymin, int xmax, int ymax)
     {
@@ -369,6 +378,17 @@ void producer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *frames_d
     }
 }
 
+enum DetectMode {
+    MODE_ROI,      // 只检测裁剪区域（快）
+    MODE_FULL      // 全图检测（慢，但兜底）
+};
+
+/*
+    裁剪窗口类
+*/
+
+
+
 /*
 第一层（检测层）：yolo检测层
 第二层（筛选层）：筛选跟踪目标——解决“同一帧多个球，选哪个？”
@@ -410,10 +430,17 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     // 初始化跟踪器
     TrackFrame tracker;
     tracker.Init(50);
+    // === 裁剪检测模式参数 ===
+    DetectMode detect_mode = MODE_ROI;
+    int roi_miss_count = 0;
+    const int ROI_MISS_THRESHOLD = 2; // 连续帧丢失 → 全图
+    bool found_target = false;
+    bool crop_allocated = false;
     // 初始化裁切窗口
     crop_window crop_win(PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
 
     while (true) {
+        found_target = false;
         frame_track_count++;
         if(src_image.width == 0 && src_image.height == 0){
             memset(&src_image, 0, sizeof(image_buffer_t));
@@ -427,6 +454,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
 
         //获取动态裁切接口
         crop_win.get_crop_window(&src_image, &crop_image);
+        crop_allocated = true;
 
         // === 推理 / 处理 ===
         object_detect_result_list od_results; 
@@ -437,81 +465,162 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             memset(&src_image, 0, sizeof(image_buffer_t));
             continue;
         }
+        //推理前判断需要选择什么图去检测
+        image_buffer_t *detect_image = nullptr;
+        if (detect_mode == MODE_ROI)
+        {
+            detect_image = &crop_image; // ROI：小图检测
+        }
+        else
+        {
+            detect_image = &src_image; // FULL：整图检测
+        }
+        inference_yolov8_model(&rknn_app_ctx, detect_image, &od_results);
 
-        inference_yolov8_model(&rknn_app_ctx, &crop_image, &od_results);
+        // === 检测模式 ===
+        printf("检测模式\n");
+        if (detect_mode == MODE_ROI)
+        {
+            printf("ROI小图模式\n");
 
-        char text[256];  
-        int j = 0;     
-        for (j = 0; j < od_results.count; j++){
-            object_detect_result *det = &(od_results.results[j]);
-
-            int x1 = det->box.left;
-            int y1 = det->box.top;
-            int x2 = det->box.right;
-            int y2 = det->box.bottom;
-
-            sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
-            //过滤球目标
-            if (strncmp(text, "ball", 4) == 0)
+            char text[256];
+            int j = 0;
+            for (j = 0; j < od_results.count; j++)
             {
-                printf("*cls_id:%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det->cls_id),
-                det->box.left, det->box.top,
-                det->box.right, det->box.bottom,
-                det->prop);
+                object_detect_result *det = &(od_results.results[j]);
 
-                draw_rectangle(&crop_image, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
-                draw_text(&crop_image, text, x1, y1 - 20, COLOR_RED, 10);
+                int x1 = det->box.left;
+                int y1 = det->box.top;
+                int x2 = det->box.right;
+                int y2 = det->box.bottom;
 
-                /******************球的跟踪预测入口*********************/
-
-                // 将 YOLO的输出结果作为跟踪的输入放入结构体DetectObject中
-                std::vector<T_DetectObject> detections;
-                for (int k = 0; k < od_results.count; k++)
+                sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
+                // 过滤球目标
+                if (strncmp(text, "ball", 4) == 0)
                 {
-                    auto &det = od_results.results[k];
+                    found_target = true;
+                    printf("*cls_id:%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det->cls_id),
+                           det->box.left, det->box.top,
+                           det->box.right, det->box.bottom,
+                           det->prop);
 
-                    T_DetectObject obj;
-                    obj.cls_id = det.cls_id;
-                    obj.score = det.prop;
-                    obj.xmin = det.box.left;
-                    obj.ymin = det.box.top;
-                    obj.xmax = det.box.right;
-                    obj.ymax = det.box.bottom;
+                    draw_rectangle(&crop_image, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
+                    draw_text(&crop_image, text, x1, y1 - 20, COLOR_RED, 10);
 
-                    detections.push_back(obj);
+                    /******************球的跟踪预测入口*********************/
+
+                    // 将 YOLO的输出结果作为跟踪的输入放入结构体DetectObject中
+                    std::vector<T_DetectObject> detections;
+                    for (int k = 0; k < od_results.count; k++)
+                    {
+                        auto &det = od_results.results[k];
+
+                        T_DetectObject obj;
+                        obj.cls_id = det.cls_id;
+                        obj.score = det.prop;
+                        obj.xmin = det.box.left;
+                        obj.ymin = det.box.top;
+                        obj.xmax = det.box.right;
+                        obj.ymax = det.box.bottom;
+
+                        detections.push_back(obj);
+                    }
+                    // 调用跟踪算法
+                    std::vector<T_TrackObject> track_results;
+                    tracker.ProcessFrame(frame_track_count, crop_image, detections, track_results);
+
+                    /******************球的跟踪预测出口*********************/
+                    printf("track_results.size() = %d\n", track_results.size());
+                    if (track_results.size() > 0)
+                    {
+                        printf("draw_rectangle @ (%d %d %d %d)\n", track_results[0].xmin, track_results[0].ymin, track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin);
+                        draw_rectangle(&crop_image, track_results[0].xmin, track_results[0].ymin,
+                                       track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin, COLOR_GREEN, 3);
+
+                        /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
+                        // 更新裁切窗口
+                        auto &t = track_results[0];
+
+                        // 裁剪图 → 原图坐标
+                        int oxmin = crop_win.get_rect().left + t.xmin;
+                        int oymin = crop_win.get_rect().top + t.ymin;
+                        int oxmax = crop_win.get_rect().left + t.xmax;
+                        int oymax = crop_win.get_rect().top + t.ymax;
+
+                        // 用“原图坐标”更新裁剪窗口
+                        crop_win.update_by_target(oxmin, oymin, oxmax, oymax);
+                    }
+
+                    // 这个break是测试下用的, 只检测第一个目标,多目标情况下还需要其他处理
+                    break;
                 }
-                // 调用跟踪算法
-                std::vector<T_TrackObject> track_results;
-                tracker.ProcessFrame(frame_track_count, crop_image, detections, track_results);
-
-                /******************球的跟踪预测出口*********************/
-                printf("track_results.size() = %d\n", track_results.size());
-                if (track_results.size() > 0)
+            }
+            if (found_target)
+            {
+                roi_miss_count = 0;
+            }
+            else
+            {
+                roi_miss_count++;
+                if (roi_miss_count >= ROI_MISS_THRESHOLD)
                 {
-                    printf("draw_rectangle @ (%d %d %d %d)\n", track_results[0].xmin, track_results[0].ymin, track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin);
-                    draw_rectangle(&crop_image, track_results[0].xmin, track_results[0].ymin,
-                                   track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin, COLOR_GREEN, 3);
+                    printf("[INFO] ROI lost, switch to FULL detect\n");
+                    detect_mode = MODE_FULL;
+                    roi_miss_count = 0;
 
-                    /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
-                    // 更新裁切窗口
-                    auto &t = track_results[0];
-
-                    // 裁剪图 → 原图坐标
-                    int oxmin = crop_win.get_rect().left + t.xmin;
-                    int oymin = crop_win.get_rect().top + t.ymin;
-                    int oxmax = crop_win.get_rect().left + t.xmax;
-                    int oymax = crop_win.get_rect().top + t.ymax;
-
-                    // 用“原图坐标”更新裁剪窗口
-                    crop_win.update_by_target(oxmin, oymin, oxmax, oymax);
+                    // ★ 重置裁剪窗口到整图中心（非常关键）
+                    //crop_win.reset_to_center();
                 }
+            }
+        }
+        else // MODE_FULL
+        {
+            printf("FULL整图模式\n");
 
-                // 这个break是测试下用的
-                break;
-            } 
+            char text[256];
+            int j = 0;
+            for (j = 0; j < od_results.count; j++)
+            {
+                object_detect_result *det = &(od_results.results[j]);
+
+                int x1 = det->box.left;
+                int y1 = det->box.top;
+                int x2 = det->box.right;
+                int y2 = det->box.bottom;
+
+                sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
+                // 过滤球目标
+                if (strncmp(text, "ball", 4) == 0)
+                {
+                    found_target = true;
+                    printf("*cls_id:%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det->cls_id),
+                           det->box.left, det->box.top,
+                           det->box.right, det->box.bottom,
+                           det->prop);
+
+                    draw_rectangle(&crop_image, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
+                    draw_text(&crop_image, text, x1, y1 - 20, COLOR_RED, 10);
+
+                    // === 用检测结果直接初始化裁剪窗口 ===
+                    crop_win.update_by_target(
+                        det->box.left,
+                        det->box.top,
+                        det->box.right,
+                        det->box.bottom);
+
+                }
+            }
+                    
+                    
+
+            if (found_target)
+            {
+                printf("[INFO] Target re-found, switch to ROI detect\n");
+                detect_mode = MODE_ROI;
+                roi_miss_count = 0;
+            }
         }
 
-        
         //保存结果输出
         printf("*保存结果输出\n");
         char out_path[256];
@@ -519,13 +628,12 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         write_image(out_path, &crop_image);
         frame_count++;
         // ===== 释放裁剪图内存=====
-        if (crop_image.virt_addr)
+        if (crop_allocated && crop_image.virt_addr)
         {
             free(crop_image.virt_addr);
             crop_image.virt_addr = NULL;
         }
         // === 回收 ===
-        // src_image = crop_image;
         pool.release(src_image);
         memset(&src_image, 0, sizeof(image_buffer_t));
              
