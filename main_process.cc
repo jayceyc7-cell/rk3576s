@@ -123,6 +123,15 @@ public:
         target_cy_ = cy_;
 
         vx_ = vy_ = 0.0f;
+        
+        // 预测状态初始化
+        pred_cx_ = cx_;
+        pred_cy_ = cy_;
+        pred_vx_ = 0.0f;
+        pred_vy_ = 0.0f;
+        
+        miss_frames_ = 0;
+        confidence_ = 1.0f;
 
         update_rect();
     }
@@ -146,50 +155,245 @@ public:
         cy_ = img_h_ * 0.5f;
         target_cx_ = cx_;
         target_cy_ = cy_;
+        
+        pred_cx_ = cx_;
+        pred_cy_ = cy_;
+        pred_vx_ = 0.0f;
+        pred_vy_ = 0.0f;
+        
+        miss_frames_ = 0;
+        confidence_ = 1.0f;
+        
         update_rect();
     }
 
-
-    void update_by_target(int xmin, int ymin, int xmax, int ymax)
+    // ============ 核心改进：舒适区运镜逻辑 ============
+    void update_by_target(int xmin, int ymin, int xmax, int ymax, bool is_detection = true)
     {
-        // 1. 目标中心
-        target_cx_ = 0.5f * (xmin + xmax);
-        target_cy_ = 0.5f * (ymin + ymax);
+        // ===== 调试日志 =====
+        printf("\n========== update_by_target DEBUG ==========\n");
+        printf("输入目标框（原图坐标）: (%d, %d, %d, %d)\n", xmin, ymin, xmax, ymax);
+        printf("当前窗口中心（原图坐标）: (%.1f, %.1f)\n", cx_, cy_);
+        printf("裁剪窗口大小: %d x %d\n", crop_w_, crop_h_);
 
-        // 2. 位置误差
+        // 输入参数是原图坐标系的目标框
+        // cx_, cy_ 是当前裁剪窗口中心在原图坐标系的位置
+
+        // 1. 目标中心（原图坐标系）
+        float target_cx_origin = 0.5f * (xmin + xmax);
+        float target_cy_origin = 0.5f * (ymin + ymax);
+
+        printf("目标中心（原图坐标）: (%.1f, %.1f)\n", target_cx_origin, target_cy_origin);
+
+        // 2. 目标相对于裁剪窗口中心的偏移（原图坐标系）
+        float offset_x = target_cx_origin - cx_;
+        float offset_y = target_cy_origin - cy_;
+
+        printf("目标偏移量: (%.1f, %.1f)\n", offset_x, offset_y);
+
+        // ============ 舒适区判断 ============
+        float comfort_zone_half_w = crop_w_ * comfort_zone_ratio_w_;
+        float comfort_zone_half_h = crop_h_ * comfort_zone_ratio_h_;
+
+        printf("舒适区半宽高: (%.1f, %.1f)\n", comfort_zone_half_w, comfort_zone_half_h);
+
+        // 计算目标超出舒适区的距离
+        float exceed_x = 0.0f;
+        float exceed_y = 0.0f;
+
+        if (fabs(offset_x) > comfort_zone_half_w)
+        {
+            exceed_x = offset_x - (offset_x > 0 ? comfort_zone_half_w : -comfort_zone_half_w);
+        }
+
+        if (fabs(offset_y) > comfort_zone_half_h)
+        {
+            exceed_y = offset_y - (offset_y > 0 ? comfort_zone_half_h : -comfort_zone_half_h);
+        }
+
+        printf("超出舒适区距离: (%.1f, %.1f)\n", exceed_x, exceed_y);
+
+        // 4. 根据来源调整置信度
+        if (is_detection)
+        {
+            confidence_ = 1.0f;
+            miss_frames_ = 0;
+
+            if (exceed_x != 0.0f || exceed_y != 0.0f)
+            {
+                float dt = 1.0f;
+                pred_vx_ = exceed_x / dt;
+                pred_vy_ = exceed_y / dt;
+            }
+            pred_cx_ = cx_ + exceed_x;
+            pred_cy_ = cy_ + exceed_y;
+
+            printf("检测模式: 置信度=1.0\n");
+        }
+        else
+        {
+            miss_frames_++;
+            float decay_factor = miss_frames_ * 0.1f;
+            confidence_ = std::max(0.3f, 1.0f - decay_factor);
+
+            exceed_x *= 0.8f;
+            exceed_y *= 0.8f;
+
+            pred_cx_ = 0.7f * pred_cx_ + 0.3f * (cx_ + exceed_x);
+            pred_cy_ = 0.7f * pred_cy_ + 0.3f * (cy_ + exceed_y);
+
+            printf("跟踪模式: 置信度=%.2f, 丢失帧数=%d\n", confidence_, miss_frames_);
+        }
+
+        // 5. 在舒适区内：不触发运镜
+        if (fabs(exceed_x) < 1.0f && fabs(exceed_y) < 1.0f)
+        {
+            printf(">>> 目标在舒适区内，镜头保持静止\n");
+            printf("============================================\n\n");
+
+            vx_ *= 0.85f;
+            vy_ *= 0.85f;
+
+            cx_ += vx_;
+            cy_ += vy_;
+
+            limit_center();
+            update_rect();
+            return;
+        }
+
+        printf(">>> 目标超出舒适区，开始运镜\n");
+
+        // ============ 超出舒适区：开始运镜 ============
+        // 6. 计算目标位置（原图坐标系）
+        float new_target_cx = cx_ + exceed_x;
+        float new_target_cy = cy_ + exceed_y;
+
+        target_cx_ = new_target_cx;
+        target_cy_ = new_target_cy;
+
+        printf("运镜目标位置: (%.1f, %.1f)\n", target_cx_, target_cy_);
+
+        // 7. 位置误差
         float ex = target_cx_ - cx_;
         float ey = target_cy_ - cy_;
 
-        // 3. 死区（抑制微抖）
-        if (fabs(ex) < dead_zone_px_)
+        printf("位置误差: (%.1f, %.1f)\n", ex, ey);
+
+        // 8. 微小死区
+        const float micro_dead_zone = 2.0f;
+        if (fabs(ex) < micro_dead_zone)
             ex = 0.0f;
-        if (fabs(ey) < dead_zone_py_)
+        if (fabs(ey) < micro_dead_zone)
             ey = 0.0f;
 
-        // ================= 二阶系统参数 =================
-        const float k_p = 0.08f;   // 位置增益（越大越跟手，0.05~0.15）
-        const float k_d = 0.95f;    // 阻尼（0.7~0.95，越大越稳）
-        const float max_v = 80.0f; // 最大速度（像素/帧，防止拉扯）
+        // 9. 动态参数
+        float ratio_x = fabs(exceed_x) / comfort_zone_half_w;
+        float ratio_y = fabs(exceed_y) / comfort_zone_half_h;
+        float exceed_ratio = std::min(1.0f, std::max(ratio_x, ratio_y));
 
-        // 4. 加速度（比例项）
+        float k_p = 0.05f + 0.03f * exceed_ratio * confidence_;
+        float k_d = 0.93f + 0.02f * (1.0f - confidence_);
+        float max_v = 50.0f + 30.0f * exceed_ratio * confidence_;
+
+        printf("控制参数: k_p=%.3f, k_d=%.3f, max_v=%.1f\n", k_p, k_d, max_v);
+
+        // 10. 加速度
         float ax = k_p * ex;
         float ay = k_p * ey;
 
-        // 5. 更新速度（带阻尼）
+        // 11. 更新速度
         vx_ = k_d * vx_ + ax;
         vy_ = k_d * vy_ + ay;
 
-        // 6. 限速（防止大跳）
+        // 12. 限速
         vx_ = clamp(vx_, -max_v, max_v);
         vy_ = clamp(vy_, -max_v, max_v);
 
-        // 7. 积分得到位置
+        printf("速度: (%.2f, %.2f)\n", vx_, vy_);
+
+        // 13. 积分得到位置
         cx_ += vx_;
         cy_ += vy_;
 
-        // 8. 边界限制
+        printf("新窗口中心: (%.1f, %.1f)\n", cx_, cy_);
+
+        // 14. 边界限制
         limit_center();
         update_rect();
+
+        printf("最终窗口: left=%d, top=%d, right=%d, bottom=%d\n",
+               rect_.left, rect_.top, rect_.right, rect_.bottom);
+        printf("============================================\n\n");
+    }
+
+    // ============ 完全丢失时的惯性更新 ============
+    void update_with_prediction()
+    {
+        miss_frames_++;
+        
+        // 置信度快速衰减
+        float decay_factor = miss_frames_ * 0.15f;
+        confidence_ = std::max(0.0f, 1.0f - decay_factor);
+        
+        // 使用预测位置 + 速度衰减
+        float decay_multiplier = miss_frames_ * 0.1f;
+        float decay = std::exp(-decay_multiplier);
+        
+        pred_cx_ += pred_vx_ * decay;
+        pred_cy_ += pred_vy_ * decay;
+        
+        // 预测速度也衰减
+        pred_vx_ *= 0.95f;
+        pred_vy_ *= 0.95f;
+        
+        // 使用预测位置作为目标
+        target_cx_ = pred_cx_;
+        target_cy_ = pred_cy_;
+        
+        // 保持平滑运动（高阻尼）
+        float ex = target_cx_ - cx_;
+        float ey = target_cy_ - cy_;
+        
+        const float k_p = 0.02f;  // 惯性模式：极低增益
+        const float k_d = 0.97f;  // 高阻尼
+        const float max_v = 30.0f; // 低速度上限
+        
+        float ax = k_p * ex;
+        float ay = k_p * ey;
+        
+        vx_ = k_d * vx_ + ax;
+        vy_ = k_d * vy_ + ay;
+        
+        vx_ = clamp(vx_, -max_v, max_v);
+        vy_ = clamp(vy_, -max_v, max_v);
+        
+        cx_ += vx_;
+        cy_ += vy_;
+        
+        limit_center();
+        update_rect();
+    }
+    
+    // 获取当前置信度（用于外部判断）
+    float get_confidence() const { return confidence_; }
+    int get_miss_frames() const { return miss_frames_; }
+    
+    // ============ 新增：设置舒适区大小 ============
+    void set_comfort_zone(float ratio_w, float ratio_h) {
+        comfort_zone_ratio_w_ = clamp(ratio_w, 0.1f, 0.5f);
+        comfort_zone_ratio_h_ = clamp(ratio_h, 0.1f, 0.5f);
+    }
+    
+    // 获取舒适区参数（用于可视化）
+    void get_comfort_zone_rect(int& left, int& top, int& width, int& height) const {
+        float half_w = crop_w_ * comfort_zone_ratio_w_;
+        float half_h = crop_h_ * comfort_zone_ratio_h_;
+        
+        left = static_cast<int>(crop_w_ * 0.5f - half_w);
+        top = static_cast<int>(crop_h_ * 0.5f - half_h);
+        width = static_cast<int>(half_w * 2);
+        height = static_cast<int>(half_h * 2);
     }
 
 private:
@@ -203,16 +407,23 @@ private:
 
     image_rect_t rect_;
 
-    // ================= 调参区（非常重要） =================
-    //const float alpha_ = 0.2f;       // 平滑系数（0.15~0.3 推荐）
-    const float dead_zone_px_ = 500.0f; // 死区像素（5~15）
-    const float dead_zone_py_ = 500.0f;
+    // ================= 舒适区参数（核心调参区）=================
+    // 舒适区大小 = 裁剪窗口大小 × ratio
+    // 推荐值：0.15-0.25（即裁剪窗口中心的15%-25%区域）
+    float comfort_zone_ratio_w_ = 0.50f;  // 宽度比例：推荐0.15-0.30
+    float comfort_zone_ratio_h_ = 0.50f;  // 高度比例：推荐0.15-0.30
+    
     // ===== 二阶模型状态 =====
     float vx_ = 0.0f;
     float vy_ = 0.0f;
+    
+    // ===== 预测状态 =====
+    float pred_cx_, pred_cy_;
+    float pred_vx_, pred_vy_;
+    int miss_frames_;
+    float confidence_;
 
 private:
-    // 根据中心更新裁剪框
     void update_rect()
     {
         rect_.left   = static_cast<int>(cx_ - crop_w_ * 0.5f);
@@ -223,7 +434,6 @@ private:
         limit_rect();
     }
 
-    // 中心点限幅（保证裁剪框不出界）
     void limit_center()
     {
         cx_ = std::max(crop_w_ * 0.5f,
@@ -233,7 +443,6 @@ private:
               std::min(cy_, img_h_ - crop_h_ * 0.5f));
     }
 
-    // 裁剪框边界修正（双保险）
     void limit_rect()
     {
         if (rect_.left < 0) {
@@ -254,6 +463,11 @@ private:
         }
     }
 
+    float clamp(float val, float min_val, float max_val)
+    {
+        return std::max(min_val, std::min(val, max_val));
+    }
+
     // 红色裁剪框（始终画）
     void draw_crop_rect(image_buffer_t* img)
     {
@@ -266,27 +480,14 @@ private:
             3);
     }
 
-    // 实际裁剪（你工程里换回 image_crop 即可）
-    // void crop_image(image_buffer_t* src, image_buffer_t* dst)
-    // {
-    //     // 正式版本：
-    //     // image_crop(src, dst, rect_);
-
-    //     // 临时占位（调试）
-    //     *dst = *src;
-    // }
     void crop_image(image_buffer_t *src, image_buffer_t *dst)
     {
         if (!src || !dst)
             return;
 
-        // 1. 使用跟踪得到的裁剪框
         image_rect_t box = rect_;
-
-        // 2. 实际裁剪后在 src 中使用的区域（调试用）
         image_rect_t real_crop_rect;
 
-        // 3. 调用你已经实现好的裁剪算法
         int ret = crop_alg_image(
             src,
             dst,
@@ -446,38 +647,47 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         return;
     }
 
-    // 创建输出目录（假如不存在）
     char cmd[256];
     sprintf(cmd, "mkdir -p %s", out_dir);
     system(cmd);
 
-    struct timeval start, end;
-    double time_use = 0;
-    double total_time_use = 0;
     int frame_count = 0;
     int frame_track_count = 0;
-    image_rect_t obj_rect = {0};
-    image_rect_t last_obj_rect = {0};
-    bool first_frame = true;
-    image_rect_t crop_rect = {0};
     image_buffer_t src_image = {0};
-    image_buffer_t save_image = {0};
     image_buffer_t crop_image = {0};
+    
     // 初始化跟踪器
     TrackFrame tracker;
     tracker.Init(50);
-    // === 裁剪检测模式参数 ===
+    
+    // === 改进的检测模式参数 ===
     DetectMode detect_mode = MODE_ROI;
     int roi_miss_count = 0;
-    const int ROI_MISS_THRESHOLD = 2; // 连续帧丢失 → 全图
+    const int ROI_MISS_THRESHOLD = 5;  // 提高阈值，减少模式切换
+    const int FULL_FIND_THRESHOLD = 2; // 整图模式连续检测到2次才切换回ROI
+    int full_find_count = 0;
+    
     bool found_target = false;
     bool crop_allocated = false;
+    bool has_track_result = false;  // 新增：标记是否有跟踪结果
+    
     // 初始化裁切窗口
     crop_window crop_win(PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
+    
+    // ============ 设置舒适区大小（核心调参） ============
+    // 参数含义：舒适区占裁剪窗口的比例
+    // 0.20 表示中心40%区域（左右各20%）
+    // 推荐范围：0.15-0.30
+    // - 0.15：较小舒适区，运镜更积极
+    // - 0.20：平衡（推荐）
+    // - 0.25：较大舒适区，运镜更保守
+    crop_win.set_comfort_zone(0.20f, 0.20f);  // 宽度20%, 高度20%
 
     while (true) {
         found_target = false;
+        has_track_result = false;
         frame_track_count++;
+        
         if(src_image.width == 0 && src_image.height == 0){
             memset(&src_image, 0, sizeof(image_buffer_t));
             if (!fq.pop(src_image)){
@@ -496,183 +706,198 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         object_detect_result_list od_results; 
         if(crop_image.virt_addr == NULL){
             printf("------crop_image is NULL\n");
-            // === 回收 ===
             pool.release(src_image);
             memset(&src_image, 0, sizeof(image_buffer_t));
             continue;
         }
+        
         //推理前判断需要选择什么图去检测
         image_buffer_t *detect_image = nullptr;
         if (detect_mode == MODE_ROI)
         {
-            detect_image = &crop_image; // ROI：小图检测
+            detect_image = &crop_image;
         }
         else
         {
-            detect_image = &src_image; // FULL：整图检测
+            detect_image = &src_image;
         }
         inference_yolov8_model(&rknn_app_ctx, detect_image, &od_results);
 
-        // === 检测模式 ===
-        printf("检测模式\n");
+        // ============ 核心改进：统一的检测+跟踪逻辑 ============
+        printf("检测模式: %s, 置信度: %.2f\n", 
+               detect_mode == MODE_ROI ? "ROI" : "FULL",
+               crop_win.get_confidence());
+
+        // 1. 准备检测结果供跟踪使用
+        std::vector<T_DetectObject> detections;
+        for (int k = 0; k < od_results.count; k++)
+        {
+            auto &det = od_results.results[k];
+            char text[256];
+            sprintf(text, "%s %.1f%%", coco_cls_to_name(det.cls_id), det.prop * 100);
+            
+            if (strncmp(text, "ball", 4) == 0)
+            {
+                T_DetectObject obj;
+                obj.cls_id = det.cls_id;
+                obj.score = det.prop;
+                obj.xmin = det.box.left;
+                obj.ymin = det.box.top;
+                obj.xmax = det.box.right;
+                obj.ymax = det.box.bottom;
+                detections.push_back(obj);
+                
+                found_target = true;
+                
+                printf("*检测到球: @ (%d %d %d %d) %.3f\n",
+                       det.box.left, det.box.top,
+                       det.box.right, det.box.bottom,
+                       det.prop);
+                
+                draw_rectangle(&crop_image, det.box.left, det.box.top,
+                             det.box.right - det.box.left,
+                             det.box.bottom - det.box.top,
+                             COLOR_BLUE, 3);
+                draw_text(&crop_image, text, det.box.left, det.box.top - 20, COLOR_RED, 10);
+            }
+        }
+
+        // 2. 调用跟踪（不管有没有检测结果都调用）
+        std::vector<T_TrackObject> track_results;
+        tracker.ProcessFrame(frame_track_count, crop_image, detections, track_results);
+
+        // 3. 根据检测和跟踪结果更新裁剪窗口
         if (detect_mode == MODE_ROI)
         {
-            printf("ROI小图模式\n");
-
-            char text[256];
-            int j = 0;
-            for (j = 0; j < od_results.count; j++)
+            if (found_target && track_results.size() > 0)
             {
-                object_detect_result *det = &(od_results.results[j]);
-
-                int x1 = det->box.left;
-                int y1 = det->box.top;
-                int x2 = det->box.right;
-                int y2 = det->box.bottom;
-
-                sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
-                // 过滤球目标
-                if (strncmp(text, "ball", 4) == 0)
-                {
-                    found_target = true;
-                    printf("*cls_id:%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det->cls_id),
-                           det->box.left, det->box.top,
-                           det->box.right, det->box.bottom,
-                           det->prop);
-
-                    draw_rectangle(&crop_image, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
-                    draw_text(&crop_image, text, x1, y1 - 20, COLOR_RED, 10);
-
-                    /******************球的跟踪预测入口*********************/
-
-                    // 将 YOLO的输出结果作为跟踪的输入放入结构体DetectObject中
-                    std::vector<T_DetectObject> detections;
-                    for (int k = 0; k < od_results.count; k++)
-                    {
-                        auto &det = od_results.results[k];
-
-                        T_DetectObject obj;
-                        obj.cls_id = det.cls_id;
-                        obj.score = det.prop;
-                        obj.xmin = det.box.left;
-                        obj.ymin = det.box.top;
-                        obj.xmax = det.box.right;
-                        obj.ymax = det.box.bottom;
-
-                        detections.push_back(obj);
-                    }
-                    // 调用跟踪算法
-                    std::vector<T_TrackObject> track_results;
-                    tracker.ProcessFrame(frame_track_count, crop_image, detections, track_results);
-
-                    /******************球的跟踪预测出口*********************/
-                    printf("track_results.size() = %d\n", track_results.size());
-                    if (track_results.size() > 0)
-                    {
-                        printf("draw_rectangle @ (%d %d %d %d)\n", track_results[0].xmin, track_results[0].ymin, track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin);
-                        draw_rectangle(&crop_image, track_results[0].xmin, track_results[0].ymin,
-                                       track_results[0].xmax - track_results[0].xmin, track_results[0].ymax - track_results[0].ymin, COLOR_GREEN, 3);
-
-                        /*跟踪预测结果不能直接作为画面裁剪的输入，需要先经过一个过滤器来判断是否跟新裁剪窗口*/
-                        // 更新裁切窗口
-                        auto &t = track_results[0];
-
-                        // 裁剪图 → 原图坐标
-                        int oxmin = crop_win.get_rect().left + t.xmin;
-                        int oymin = crop_win.get_rect().top + t.ymin;
-                        int oxmax = crop_win.get_rect().left + t.xmax;
-                        int oymax = crop_win.get_rect().top + t.ymax;
-
-                        // 用“原图坐标”更新裁剪窗口
-                        crop_win.update_by_target(oxmin, oymin, oxmax, oymax);
-                    }
-
-                    // 这个break是测试下用的, 只检测第一个目标,多目标情况下还需要其他处理
-                    break;
-                }
-            }
-            if (found_target)
-            {
+                // 场景A：检测+跟踪都成功 → 用跟踪结果，高置信度
+                auto &t = track_results[0];
+                
+                draw_rectangle(&crop_image, t.xmin, t.ymin,
+                             t.xmax - t.xmin, t.ymax - t.ymin,
+                             COLOR_GREEN, 3);
+                
+                // ============ 可选：绘制舒适区（调试用）============
+                int cz_left, cz_top, cz_width, cz_height;
+                crop_win.get_comfort_zone_rect(cz_left, cz_top, cz_width, cz_height);
+                draw_rectangle(&crop_image, cz_left, cz_top, cz_width, cz_height,
+                             COLOR_YELLOW, 2);  // 黄色虚线表示舒适区
+                
+                // 转换到原图坐标
+                int oxmin = crop_win.get_rect().left + t.xmin;
+                int oymin = crop_win.get_rect().top + t.ymin;
+                int oxmax = crop_win.get_rect().left + t.xmax;
+                int oymax = crop_win.get_rect().top + t.ymax;
+                
+                crop_win.update_by_target(oxmin, oymin, oxmax, oymax, true);
                 roi_miss_count = 0;
+                has_track_result = true;
+            }
+            else if (!found_target && track_results.size() > 0)
+            {
+                // 场景B：检测失败但跟踪成功 → 用跟踪结果，中置信度
+                auto &t = track_results[0];
+                
+                draw_rectangle(&crop_image, t.xmin, t.ymin,
+                             t.xmax - t.xmin, t.ymax - t.ymin,
+                             COLOR_YELLOW, 3);  // 黄色表示仅跟踪
+                
+                int oxmin = crop_win.get_rect().left + t.xmin;
+                int oymin = crop_win.get_rect().top + t.ymin;
+                int oxmax = crop_win.get_rect().left + t.xmax;
+                int oymax = crop_win.get_rect().top + t.ymax;
+                
+                crop_win.update_by_target(oxmin, oymin, oxmax, oymax, false);
+                roi_miss_count++;  // 仍然计数，但允许跟踪维持运镜
+                has_track_result = true;
+                
+                printf("[INFO] 仅跟踪模式，丢失计数: %d/%d\n", 
+                       roi_miss_count, ROI_MISS_THRESHOLD);
             }
             else
             {
+                // 场景C：检测和跟踪都失败 → 使用惯性预测
+                printf("[WARN] 检测和跟踪都丢失，使用惯性预测\n");
+                crop_win.update_with_prediction();
                 roi_miss_count++;
-                if (roi_miss_count >= ROI_MISS_THRESHOLD)
-                {
-                    printf("[INFO] ROI lost, switch to FULL detect\n");
-                    detect_mode = MODE_FULL;
-                    roi_miss_count = 0;
-
-                    // ★ 重置裁剪窗口到整图中心（非常关键）
-                    //crop_win.reset_to_center();
-                }
+            }
+            
+            // 连续丢失过多才切换到全图
+            if (roi_miss_count >= ROI_MISS_THRESHOLD)
+            {
+                printf("[INFO] ROI连续丢失%d帧，切换到FULL模式\n", roi_miss_count);
+                detect_mode = MODE_FULL;
+                roi_miss_count = 0;
+                full_find_count = 0;
+                // 不重置裁剪窗口，保持当前位置继续搜索
             }
         }
         else // MODE_FULL
         {
-            printf("FULL整图模式\n");
-
-            char text[256];
-            int j = 0;
-            for (j = 0; j < od_results.count; j++)
-            {
-                object_detect_result *det = &(od_results.results[j]);
-
-                int x1 = det->box.left;
-                int y1 = det->box.top;
-                int x2 = det->box.right;
-                int y2 = det->box.bottom;
-
-                sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
-                // 过滤球目标
-                if (strncmp(text, "ball", 4) == 0)
-                {
-                    found_target = true;
-                    printf("*cls_id:%s @ (%d %d %d %d) %.3f\n", coco_cls_to_name(det->cls_id),
-                           det->box.left, det->box.top,
-                           det->box.right, det->box.bottom,
-                           det->prop);
-
-                    draw_rectangle(&crop_image, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
-                    draw_text(&crop_image, text, x1, y1 - 20, COLOR_RED, 10);
-
-                    // === 用检测结果直接初始化裁剪窗口 ===
-                    crop_win.update_by_target(
-                        det->box.left,
-                        det->box.top,
-                        det->box.right,
-                        det->box.bottom);
-
-                }
-            }
-                    
-                    
-
             if (found_target)
             {
-                printf("[INFO] Target re-found, switch to ROI detect\n");
-                detect_mode = MODE_ROI;
-                roi_miss_count = 0;
+                // 整图模式检测到目标
+                for (int j = 0; j < od_results.count; j++)
+                {
+                    object_detect_result *det = &(od_results.results[j]);
+                    char text[256];
+                    sprintf(text, "%s %.1f%%", coco_cls_to_name(det->cls_id), det->prop * 100);
+                    
+                    if (strncmp(text, "ball", 4) == 0)
+                    {
+                        draw_rectangle(&crop_image, det->box.left, det->box.top,
+                                     det->box.right - det->box.left,
+                                     det->box.bottom - det->box.top,
+                                     COLOR_BLUE, 3);
+                        draw_text(&crop_image, text, det->box.left, det->box.top - 20, COLOR_RED, 10);
+                        
+                        // 用检测结果更新裁剪窗口
+                        crop_win.update_by_target(
+                            det->box.left,
+                            det->box.top,
+                            det->box.right,
+                            det->box.bottom,
+                            true);  // 高置信度
+                        
+                        full_find_count++;
+                        break;
+                    }
+                }
+                
+                // 连续检测到才切回ROI，避免抖动
+                if (full_find_count >= FULL_FIND_THRESHOLD)
+                {
+                    printf("[INFO] FULL模式连续检测到%d次，切换回ROI\n", full_find_count);
+                    detect_mode = MODE_ROI;
+                    roi_miss_count = 0;
+                    full_find_count = 0;
+                }
+            }
+            else
+            {
+                // 整图模式也没找到，继续用惯性
+                crop_win.update_with_prediction();
+                full_find_count = 0;
             }
         }
 
-        //保存结果输出
-        printf("*保存结果输出\n");
+        // 保存结果输出
         char out_path[256];
-        sprintf(out_path, "%s/%s.%s", out_dir, std::to_string(frame_count).c_str(), "jpg");
+        sprintf(out_path, "%s/%05d.jpg", out_dir, frame_count);
         write_image(out_path, &crop_image);
         frame_count++;
-        // ===== 释放裁剪图内存=====
+        
+        // 释放裁剪图内存
         if (crop_allocated && crop_image.virt_addr)
         {
             free(crop_image.virt_addr);
             crop_image.virt_addr = NULL;
         }
-        // === 回收 ===
+        
+        // 回收原图
         pool.release(src_image);
         memset(&src_image, 0, sizeof(image_buffer_t));
-             
     }
 
     // 清理
