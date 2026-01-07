@@ -170,161 +170,129 @@ public:
     // ============ 核心改进：舒适区运镜逻辑 ============
     void update_by_target(int xmin, int ymin, int xmax, int ymax, bool is_detection = true)
     {
-        // ===== 调试日志 =====
-        printf("\n========== update_by_target DEBUG ==========\n");
-        printf("输入目标框（原图坐标）: (%d, %d, %d, %d)\n", xmin, ymin, xmax, ymax);
-        printf("当前窗口中心（原图坐标）: (%.1f, %.1f)\n", cx_, cy_);
-        printf("裁剪窗口大小: %d x %d\n", crop_w_, crop_h_);
-
         // 输入参数是原图坐标系的目标框
         // cx_, cy_ 是当前裁剪窗口中心在原图坐标系的位置
-
+        
         // 1. 目标中心（原图坐标系）
         float target_cx_origin = 0.5f * (xmin + xmax);
         float target_cy_origin = 0.5f * (ymin + ymax);
-
-        printf("目标中心（原图坐标）: (%.1f, %.1f)\n", target_cx_origin, target_cy_origin);
-
+        
         // 2. 目标相对于裁剪窗口中心的偏移（原图坐标系）
         float offset_x = target_cx_origin - cx_;
         float offset_y = target_cy_origin - cy_;
-
-        printf("目标偏移量: (%.1f, %.1f)\n", offset_x, offset_y);
-
+        
         // ============ 舒适区判断 ============
+        // 舒适区是裁剪窗口中心的一个矩形区域
+        // 只有目标移出舒适区时才触发运镜
         float comfort_zone_half_w = crop_w_ * comfort_zone_ratio_w_;
         float comfort_zone_half_h = crop_h_ * comfort_zone_ratio_h_;
-
-        printf("舒适区半宽高: (%.1f, %.1f)\n", comfort_zone_half_w, comfort_zone_half_h);
-
+        
         // 计算目标超出舒适区的距离
         float exceed_x = 0.0f;
         float exceed_y = 0.0f;
-
-        if (fabs(offset_x) > comfort_zone_half_w)
-        {
+        
+        if (fabs(offset_x) > comfort_zone_half_w) {
+            // 超出舒适区，计算超出部分
             exceed_x = offset_x - (offset_x > 0 ? comfort_zone_half_w : -comfort_zone_half_w);
         }
-
-        if (fabs(offset_y) > comfort_zone_half_h)
-        {
+        
+        if (fabs(offset_y) > comfort_zone_half_h) {
             exceed_y = offset_y - (offset_y > 0 ? comfort_zone_half_h : -comfort_zone_half_h);
         }
-
-        printf("超出舒适区距离: (%.1f, %.1f)\n", exceed_x, exceed_y);
-
+        
         // 4. 根据来源调整置信度
-        if (is_detection)
-        {
+        if (is_detection) {
+            // 检测结果：高置信度
             confidence_ = 1.0f;
             miss_frames_ = 0;
-
-            if (exceed_x != 0.0f || exceed_y != 0.0f)
-            {
+            
+            // 更新预测器状态（用于惯性预测）
+            if (exceed_x != 0.0f || exceed_y != 0.0f) {
+                // 只有在触发运镜时才更新速度
                 float dt = 1.0f;
                 pred_vx_ = exceed_x / dt;
                 pred_vy_ = exceed_y / dt;
             }
             pred_cx_ = cx_ + exceed_x;
             pred_cy_ = cy_ + exceed_y;
-
-            printf("检测模式: 置信度=1.0\n");
-        }
-        else
-        {
+            
+        } else {
+            // 跟踪结果：置信度随丢失帧数衰减
             miss_frames_++;
             float decay_factor = miss_frames_ * 0.1f;
             confidence_ = std::max(0.3f, 1.0f - decay_factor);
-
+            
+            // 跟踪模式下，舒适区稍微放宽（避免抖动）
             exceed_x *= 0.8f;
             exceed_y *= 0.8f;
-
+            
             pred_cx_ = 0.7f * pred_cx_ + 0.3f * (cx_ + exceed_x);
             pred_cy_ = 0.7f * pred_cy_ + 0.3f * (cy_ + exceed_y);
-
-            printf("跟踪模式: 置信度=%.2f, 丢失帧数=%d\n", confidence_, miss_frames_);
         }
 
         // 5. 在舒适区内：不触发运镜
-        if (fabs(exceed_x) < 1.0f && fabs(exceed_y) < 1.0f)
-        {
-            printf(">>> 目标在舒适区内，镜头保持静止\n");
-            printf("============================================\n\n");
-
+        if (fabs(exceed_x) < 1.0f && fabs(exceed_y) < 1.0f) {
+            // 目标在舒适区内，保持当前窗口位置不变
+            // 但仍然衰减速度（避免突然启动）
             vx_ *= 0.85f;
             vy_ *= 0.85f;
-
+            
+            // 微调位置（消除残余速度）
             cx_ += vx_;
             cy_ += vy_;
-
+            
             limit_center();
             update_rect();
-            return;
+            return;  // 不进行后续运镜计算
         }
-
-        printf(">>> 目标超出舒适区，开始运镜\n");
 
         // ============ 超出舒适区：开始运镜 ============
         // 6. 计算目标位置（原图坐标系）
         float new_target_cx = cx_ + exceed_x;
         float new_target_cy = cy_ + exceed_y;
-
+        
         target_cx_ = new_target_cx;
         target_cy_ = new_target_cy;
-
-        printf("运镜目标位置: (%.1f, %.1f)\n", target_cx_, target_cy_);
 
         // 7. 位置误差
         float ex = target_cx_ - cx_;
         float ey = target_cy_ - cy_;
 
-        printf("位置误差: (%.1f, %.1f)\n", ex, ey);
-
-        // 8. 微小死区
+        // 8. 微小死区（抑制1-2像素的抖动）
         const float micro_dead_zone = 2.0f;
-        if (fabs(ex) < micro_dead_zone)
-            ex = 0.0f;
-        if (fabs(ey) < micro_dead_zone)
-            ey = 0.0f;
+        if (fabs(ex) < micro_dead_zone) ex = 0.0f;
+        if (fabs(ey) < micro_dead_zone) ey = 0.0f;
 
-        // 9. 动态参数
+        // ================= 二阶系统参数（动态调整）=================
+        // 根据超出舒适区的程度动态调整响应速度
         float ratio_x = fabs(exceed_x) / comfort_zone_half_w;
         float ratio_y = fabs(exceed_y) / comfort_zone_half_h;
         float exceed_ratio = std::min(1.0f, std::max(ratio_x, ratio_y));
+        
+        // 超出越多，响应越快（但仍然保持平滑）
+        float k_p = 0.05f + 0.03f * exceed_ratio * confidence_;  // 0.05-0.08
+        float k_d = 0.93f + 0.02f * (1.0f - confidence_);        // 0.93-0.95
+        float max_v = 50.0f + 30.0f * exceed_ratio * confidence_; // 50-80
 
-        float k_p = 0.05f + 0.03f * exceed_ratio * confidence_;
-        float k_d = 0.93f + 0.02f * (1.0f - confidence_);
-        float max_v = 50.0f + 30.0f * exceed_ratio * confidence_;
-
-        printf("控制参数: k_p=%.3f, k_d=%.3f, max_v=%.1f\n", k_p, k_d, max_v);
-
-        // 10. 加速度
+        // 9. 加速度（比例项）
         float ax = k_p * ex;
         float ay = k_p * ey;
 
-        // 11. 更新速度
+        // 10. 更新速度（带阻尼）
         vx_ = k_d * vx_ + ax;
         vy_ = k_d * vy_ + ay;
 
-        // 12. 限速
+        // 11. 限速
         vx_ = clamp(vx_, -max_v, max_v);
         vy_ = clamp(vy_, -max_v, max_v);
 
-        printf("速度: (%.2f, %.2f)\n", vx_, vy_);
-
-        // 13. 积分得到位置
+        // 12. 积分得到位置
         cx_ += vx_;
         cy_ += vy_;
 
-        printf("新窗口中心: (%.1f, %.1f)\n", cx_, cy_);
-
-        // 14. 边界限制
+        // 13. 边界限制
         limit_center();
         update_rect();
-
-        printf("最终窗口: left=%d, top=%d, right=%d, bottom=%d\n",
-               rect_.left, rect_.top, rect_.right, rect_.bottom);
-        printf("============================================\n\n");
     }
 
     // ============ 完全丢失时的惯性更新 ============
@@ -410,8 +378,9 @@ private:
     // ================= 舒适区参数（核心调参区）=================
     // 舒适区大小 = 裁剪窗口大小 × ratio
     // 推荐值：0.15-0.25（即裁剪窗口中心的15%-25%区域）
-    float comfort_zone_ratio_w_ = 0.50f;  // 宽度比例：推荐0.15-0.30
-    float comfort_zone_ratio_h_ = 0.50f;  // 高度比例：推荐0.15-0.30
+    // 非对称设置：垂直方向舒适区更大 = 上下运镜更少
+    float comfort_zone_ratio_w_ = 0.20f;  // 宽度比例：0.15-0.30（水平运镜）
+    float comfort_zone_ratio_h_ = 0.40f;  // 高度比例：0.30-0.50（垂直运镜少）
     
     // ===== 二阶模型状态 =====
     float vx_ = 0.0f;
@@ -663,7 +632,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     // === 改进的检测模式参数 ===
     DetectMode detect_mode = MODE_ROI;
     int roi_miss_count = 0;
-    const int ROI_MISS_THRESHOLD = 5;  // 提高阈值，减少模式切换
+    const int ROI_MISS_THRESHOLD = 2;  // 提高阈值，减少模式切换
     const int FULL_FIND_THRESHOLD = 2; // 整图模式连续检测到2次才切换回ROI
     int full_find_count = 0;
     
@@ -674,14 +643,18 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     // 初始化裁切窗口
     crop_window crop_win(PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
     
-    // ============ 设置舒适区大小（核心调参） ============
+    // ============ 设置舒适区大小（非对称配置）============
+    // 策略：水平运镜积极，垂直运镜保守
     // 参数含义：舒适区占裁剪窗口的比例
-    // 0.20 表示中心40%区域（左右各20%）
-    // 推荐范围：0.15-0.30
-    // - 0.15：较小舒适区，运镜更积极
-    // - 0.20：平衡（推荐）
-    // - 0.25：较大舒适区，运镜更保守
-    crop_win.set_comfort_zone(0.20f, 0.20f);  // 宽度20%, 高度20%
+    // - 水平（宽度）：0.20 表示中心40%区域不触发运镜
+    // - 垂直（高度）：0.40 表示中心80%区域不触发运镜（减少上下运镜）
+    // 
+    // 调优指南：
+    // - comfort_zone_ratio_h_ 越大，上下运镜越少
+    //   0.40 = 较少上下运镜（推荐）
+    //   0.45 = 很少上下运镜
+    //   0.50 = 几乎不上下运镜
+    crop_win.set_comfort_zone(0.30f, 0.50f);  // 水平20%, 垂直40%
 
     while (true) {
         found_target = false;
@@ -876,9 +849,13 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             }
             else
             {
-                // 整图模式也没找到，继续用惯性
-                crop_win.update_with_prediction();
+                // ============ 核心修改：FULL模式不使用惯性预测 ============
+                // 整图模式也没找到，保持裁剪窗口静止（不调用 update_with_prediction）
+                printf("[INFO] FULL模式未检测到目标，保持窗口静止\n");
                 full_find_count = 0;
+                
+                // 可选：重置裁剪窗口到整图中心（如果希望重新开始搜索）
+                // crop_win.reset_to_center();
             }
         }
 
