@@ -100,6 +100,13 @@ private:
     std::mutex mutex_;
 };
 
+template <typename T>
+inline T clamp(T v, T lo, T hi)
+{
+    return (v < lo) ? lo : (v > hi) ? hi : v;
+}
+
+
 class crop_window {
 public:
     crop_window(int img_w, int img_h, int crop_w, int crop_h)
@@ -114,6 +121,8 @@ public:
 
         target_cx_ = cx_;
         target_cy_ = cy_;
+
+        vx_ = vy_ = 0.0f;
 
         update_rect();
     }
@@ -132,6 +141,7 @@ public:
 
     void reset_to_center()
     {
+        vx_ = vy_ = 0.0f;
         cx_ = img_w_ * 0.5f;
         cy_ = img_h_ * 0.5f;
         target_cx_ = cx_;
@@ -140,22 +150,75 @@ public:
     }
 
     // 仅在“检测 / 跟踪到目标”时调用
+    // void update_by_target(int xmin, int ymin, int xmax, int ymax)
+    // {
+    //     target_cx_ = 0.5f * (xmin + xmax);
+    //     target_cy_ = 0.5f * (ymin + ymax);
+
+    //     // // ===== 死区判断（小抖动不更新）=====
+    //     // if (fabs(target_cx_ - cx_) < dead_zone_px_ &&
+    //     //     fabs(target_cy_ - cy_) < dead_zone_px_)
+    //     // {
+    //     //     //return;
+    //     // }
+
+    //     // // ===== EMA 平滑 =====
+    //     // cx_ = alpha_ * target_cx_ + (1.0f - alpha_) * cx_;
+    //     // cy_ = alpha_ * target_cy_ + (1.0f - alpha_) * cy_;
+
+    //     float dx = fabs(target_cx_ - cx_);
+    //     float dy = fabs(target_cy_ - cy_);
+
+    //     float scale = std::max(dx, dy) / dead_zone_px_;
+    //     scale = clamp(scale, 0.0f, 1.0f);
+
+    //     float adaptive_alpha = alpha_ * scale;
+
+    //     cx_ = adaptive_alpha * target_cx_ + (1 - adaptive_alpha) * cx_;
+    //     cy_ = adaptive_alpha * target_cy_ + (1 - adaptive_alpha) * cy_;
+
+    //     limit_center();
+    //     update_rect();
+    // }
+
     void update_by_target(int xmin, int ymin, int xmax, int ymax)
     {
+        // 1. 目标中心
         target_cx_ = 0.5f * (xmin + xmax);
         target_cy_ = 0.5f * (ymin + ymax);
 
-        // ===== 死区判断（小抖动不更新）=====
-        if (fabs(target_cx_ - cx_) < dead_zone_px_ &&
-            fabs(target_cy_ - cy_) < dead_zone_px_)
-        {
-            return;
-        }
+        // 2. 位置误差
+        float ex = target_cx_ - cx_;
+        float ey = target_cy_ - cy_;
 
-        // ===== EMA 平滑 =====
-        cx_ = alpha_ * target_cx_ + (1.0f - alpha_) * cx_;
-        cy_ = alpha_ * target_cy_ + (1.0f - alpha_) * cy_;
+        // 3. 死区（抑制微抖）
+        if (fabs(ex) < dead_zone_px_)
+            ex = 0.0f;
+        if (fabs(ey) < dead_zone_px_)
+            ey = 0.0f;
 
+        // ================= 二阶系统参数 =================
+        const float k_p = 0.08f;   // 位置增益（越大越跟手，0.05~0.15）
+        const float k_d = 0.85f;   // 阻尼（0.7~0.95，越大越稳）
+        const float max_v = 80.0f; // 最大速度（像素/帧，防止拉扯）
+
+        // 4. 加速度（比例项）
+        float ax = k_p * ex;
+        float ay = k_p * ey;
+
+        // 5. 更新速度（带阻尼）
+        vx_ = k_d * vx_ + ax;
+        vy_ = k_d * vy_ + ay;
+
+        // 6. 限速（防止大跳）
+        vx_ = clamp(vx_, -max_v, max_v);
+        vy_ = clamp(vy_, -max_v, max_v);
+
+        // 7. 积分得到位置
+        cx_ += vx_;
+        cy_ += vy_;
+
+        // 8. 边界限制
         limit_center();
         update_rect();
     }
@@ -172,8 +235,11 @@ private:
     image_rect_t rect_;
 
     // ================= 调参区（非常重要） =================
-    const float alpha_ = 0.05f;       // 平滑系数（0.15~0.3 推荐）
-    const float dead_zone_px_ = 200.0f; // 死区像素（5~15）
+    //const float alpha_ = 0.2f;       // 平滑系数（0.15~0.3 推荐）
+    const float dead_zone_px_ = 500.0f; // 死区像素（5~15）
+    // ===== 二阶模型状态 =====
+    float vx_ = 0.0f;
+    float vy_ = 0.0f;
 
 private:
     // 根据中心更新裁剪框
