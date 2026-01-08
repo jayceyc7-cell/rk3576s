@@ -138,27 +138,31 @@ private:
     bool stop_{false};
 };
 
-/*------------------------------------------------*/
+
 /**
  * 丝滑运镜控制器 - 基于物理模型的平滑相机运动
  * 
- * 核心思想：
- * 1. 使用速度+加速度模型，而非简单的位置插值
- * 2. 引入"弹簧-阻尼"系统，让运动更自然
- * 3. 速度限制 + 加速度限制，避免急停急起
- * 4. 预测性跟踪，提前响应目标运动趋势
+ * 有效显示区域：2560 × 1130（中间区域）
+ * 顶部留白：155 像素
+ * 底部留白：155 像素
  */
 class SmoothCameraController {
 public:
-    SmoothCameraController(int img_w, int img_h, int crop_w, int crop_h)
+    SmoothCameraController(int img_w, int img_h, int crop_w, int crop_h,
+                           int valid_top = 0, int valid_bottom = -1)
         : img_w_(img_w),
           img_h_(img_h),
           crop_w_(crop_w),
           crop_h_(crop_h)
     {
-        // 初始位置：画面中心
+        // 设置有效显示区域
+        valid_top_ = valid_top;
+        valid_bottom_ = (valid_bottom < 0) ? img_h : valid_bottom;
+        valid_height_ = valid_bottom_ - valid_top_;
+        
+        // 初始位置：有效区域中心
         cx_ = img_w_ * 0.5f;
-        cy_ = img_h_ * 0.5f;
+        cy_ = valid_top_ + valid_height_ * 0.5f;
         
         // 初始速度为 0
         vx_ = 0.0f;
@@ -175,6 +179,9 @@ public:
         last_target_cy_ = cy_;
         
         update_rect();
+        
+        printf("[Camera] Valid region: y=[%d, %d], height=%d\n", 
+               valid_top_, valid_bottom_, valid_height_);
     }
 
     const image_rect_t& get_rect() const
@@ -185,9 +192,7 @@ public:
     // 每帧调用：更新相机位置 + 裁剪
     void get_crop_window(image_buffer_t* src, image_buffer_t* dst)
     {
-        // 每帧都要更新相机位置（即使没有新目标）
         update_camera_position();
-        
         draw_crop_rect(src);
         crop_image(src, dst);
     }
@@ -198,7 +203,7 @@ public:
         float new_target_cx = 0.5f * (xmin + xmax);
         float new_target_cy = 0.5f * (ymin + ymax);
         
-        // 估计目标速度（用于预测）
+        // 估计目标速度
         target_vx_ = velocity_smooth_ * (new_target_cx - last_target_cx_) 
                    + (1.0f - velocity_smooth_) * target_vx_;
         target_vy_ = velocity_smooth_ * (new_target_cy - last_target_cy_) 
@@ -207,28 +212,25 @@ public:
         last_target_cx_ = target_cx_;
         last_target_cy_ = target_cy_;
         
-        // 预测性跟踪：目标位置 + 预测偏移
+        // 预测性跟踪
         target_cx_ = new_target_cx + target_vx_ * prediction_frames_;
         target_cy_ = new_target_cy + target_vy_ * prediction_frames_;
         
-        // 限制目标在有效范围内
         limit_target();
         
-        // 重置丢失计数
         frames_without_target_ = 0;
         has_target_ = true;
     }
 
-    // 没有检测到目标时调用（可选）
+    // 没有检测到目标时调用
     void mark_no_target()
     {
         frames_without_target_++;
         
-        // 丢失目标一段时间后，缓慢回到中心
         if (frames_without_target_ > return_to_center_delay_) {
-            // 缓慢将目标设为中心
+            // 缓慢将目标设为有效区域中心
             float center_x = img_w_ * 0.5f;
-            float center_y = img_h_ * 0.5f;
+            float center_y = valid_top_ + valid_height_ * 0.5f;
             
             target_cx_ = target_cx_ + (center_x - target_cx_) * return_to_center_speed_;
             target_cy_ = target_cy_ + (center_y - target_cy_) * return_to_center_speed_;
@@ -240,74 +242,54 @@ private:
     int img_w_, img_h_;
     int crop_w_, crop_h_;
     image_rect_t rect_;
+    
+    // ================= 有效显示区域 =================
+    int valid_top_;       // 有效区域顶部 Y 坐标
+    int valid_bottom_;    // 有效区域底部 Y 坐标
+    int valid_height_;    // 有效区域高度
 
-    // ================= 相机状态（位置 + 速度）=================
-    float cx_, cy_;           // 当前相机中心位置
-    float vx_, vy_;           // 当前相机速度 (像素/帧)
+    // ================= 相机状态 =================
+    float cx_, cy_;
+    float vx_, vy_;
     
     // ================= 目标状态 =================
-    float target_cx_, target_cy_;     // 目标位置
-    float target_vx_, target_vy_;     // 目标速度估计
-    float last_target_cx_, last_target_cy_;  // 上一帧目标位置
+    float target_cx_, target_cy_;
+    float target_vx_, target_vy_;
+    float last_target_cx_, last_target_cy_;
     
     bool has_target_{false};
     int frames_without_target_{0};
 
-    // ================= 运镜参数（可调节）=================
-    
-    // --- 弹簧-阻尼系统参数 ---
-    // stiffness: 弹簧刚度，越大跟踪越紧（但太大会震荡）
-    // damping: 阻尼系数，越大运动越平稳（但太大会迟钝）
-    // 推荐：stiffness 0.02~0.08, damping 0.3~0.5
-    const float stiffness_ = 0.04f;      // 弹簧刚度
-    const float damping_ = 0.4f;         // 阻尼系数
-    
-    // --- 速度/加速度限制 ---
-    const float max_speed_ = 30.0f;      // 最大速度 (像素/帧)，约 25fps 下为 750px/s
-    const float max_accel_ = 3.0f;       // 最大加速度 (像素/帧²)
-    
-    // --- 死区参数 ---
-    // 当目标在画面中心区域时，不主动跟踪
-    const float dead_zone_ratio_ = 0.15f;  // 死区为裁剪框的 15%
-    
-    // --- 预测参数 ---
-    const float prediction_frames_ = 3.0f;   // 预测未来 N 帧的位置
-    const float velocity_smooth_ = 0.3f;     // 目标速度平滑系数
-    
-    // --- 丢失目标后回中心 ---
-    const int return_to_center_delay_ = 60;   // 丢失 N 帧后开始回中心
-    const float return_to_center_speed_ = 0.01f;  // 回中心速度
+    // ================= 运镜参数 =================
+    const float stiffness_ = 0.04f;
+    const float damping_ = 0.4f;
+    const float max_speed_ = 30.0f;
+    const float max_accel_ = 3.0f;
+    const float dead_zone_ratio_ = 0.15f;
+    const float prediction_frames_ = 3.0f;
+    const float velocity_smooth_ = 0.3f;
+    const int return_to_center_delay_ = 60;
+    const float return_to_center_speed_ = 0.01f;
 
 private:
-    /**
-     * 核心：每帧更新相机位置
-     * 使用弹簧-阻尼系统实现平滑运动
-     */
     void update_camera_position()
     {
-        // 计算目标与当前位置的偏差
         float dx = target_cx_ - cx_;
         float dy = target_cy_ - cy_;
-        float distance = std::sqrt(dx * dx + dy * dy);
         
-        // 死区判断：目标在中心附近时不移动
         float dead_zone_x = crop_w_ * dead_zone_ratio_;
         float dead_zone_y = crop_h_ * dead_zone_ratio_;
         
         if (std::fabs(dx) < dead_zone_x && std::fabs(dy) < dead_zone_y) {
-            // 在死区内，只做阻尼衰减（缓慢停止）
             vx_ *= (1.0f - damping_ * 0.5f);
             vy_ *= (1.0f - damping_ * 0.5f);
         } else {
-            // 弹簧力：F = -k * x （指向目标）
             float fx = stiffness_ * dx;
             float fy = stiffness_ * dy;
             
-            // 阻尼力：F = -c * v （阻碍运动）
             fx -= damping_ * vx_;
             fy -= damping_ * vy_;
             
-            // 限制加速度
             float accel = std::sqrt(fx * fx + fy * fy);
             if (accel > max_accel_) {
                 float scale = max_accel_ / accel;
@@ -315,12 +297,10 @@ private:
                 fy *= scale;
             }
             
-            // 更新速度：v += a
             vx_ += fx;
             vy_ += fy;
         }
         
-        // 限制最大速度
         float speed = std::sqrt(vx_ * vx_ + vy_ * vy_);
         if (speed > max_speed_) {
             float scale = max_speed_ / speed;
@@ -328,29 +308,37 @@ private:
             vy_ *= scale;
         }
         
-        // 更新位置：x += v
         cx_ += vx_;
         cy_ += vy_;
         
-        // 边界限制
         limit_center();
         update_rect();
     }
 
+    // 限制目标位置在有效区域内
     void limit_target()
     {
+        // X 方向：整个图像宽度
         target_cx_ = std::max(crop_w_ * 0.5f,
                      std::min(target_cx_, img_w_ - crop_w_ * 0.5f));
-        target_cy_ = std::max(crop_h_ * 0.5f,
-                     std::min(target_cy_, img_h_ - crop_h_ * 0.5f));
+        
+        // Y 方向：仅在有效区域内
+        float min_cy = valid_top_ + crop_h_ * 0.5f;
+        float max_cy = valid_bottom_ - crop_h_ * 0.5f;
+        target_cy_ = std::max(min_cy, std::min(target_cy_, max_cy));
     }
 
+    // 限制相机中心在有效区域内
     void limit_center()
     {
+        // X 方向
         cx_ = std::max(crop_w_ * 0.5f,
               std::min(cx_, img_w_ - crop_w_ * 0.5f));
-        cy_ = std::max(crop_h_ * 0.5f,
-              std::min(cy_, img_h_ - crop_h_ * 0.5f));
+        
+        // Y 方向：仅在有效区域内
+        float min_cy = valid_top_ + crop_h_ * 0.5f;
+        float max_cy = valid_bottom_ - crop_h_ * 0.5f;
+        cy_ = std::max(min_cy, std::min(cy_, max_cy));
     }
 
     void update_rect()
@@ -363,23 +351,27 @@ private:
         limit_rect();
     }
 
+    // 限制裁剪框在有效区域内
     void limit_rect()
     {
+        // X 方向限制
         if (rect_.left < 0) {
             rect_.left = 0;
             rect_.right = crop_w_;
-        }
-        if (rect_.top < 0) {
-            rect_.top = 0;
-            rect_.bottom = crop_h_;
         }
         if (rect_.right > img_w_) {
             rect_.right = img_w_;
             rect_.left = img_w_ - crop_w_;
         }
-        if (rect_.bottom > img_h_) {
-            rect_.bottom = img_h_;
-            rect_.top = img_h_ - crop_h_;
+        
+        // Y 方向限制：在有效区域内
+        if (rect_.top < valid_top_) {
+            rect_.top = valid_top_;
+            rect_.bottom = valid_top_ + crop_h_;
+        }
+        if (rect_.bottom > valid_bottom_) {
+            rect_.bottom = valid_bottom_;
+            rect_.top = valid_bottom_ - crop_h_;
         }
     }
 
@@ -568,8 +560,19 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     TrackFrame tracker;
     tracker.Init(50);
     
-    // ===== 使用新的丝滑运镜控制器 =====
-    SmoothCameraController camera(PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
+    // 有效区域：顶部 155 到底部 1440-155=1285
+    // 即 y ∈ [155, 1285]，高度 1130
+    constexpr int VALID_TOP = 155;
+    constexpr int VALID_BOTTOM = PIC_FULL_HEIGHT - 155;  // 1440 - 155 = 1285
+    
+    SmoothCameraController camera(
+        PIC_FULL_WIDTH, 
+        PIC_FULL_HEIGHT, 
+        ALG_CROP_WIDTH, 
+        ALG_CROP_HEIGHT,
+        VALID_TOP,      // 有效区域顶部 Y
+        VALID_BOTTOM    // 有效区域底部 Y
+    );
 
     while (true) {
         frame_track_count++;
@@ -577,7 +580,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         if (src_image.width == 0 && src_image.height == 0) {
             memset(&src_image, 0, sizeof(image_buffer_t));
             if (!fq.pop(src_image)) {
-                printf("[Consumer] Queue stopped, exiting\n");
+                printf("[Consumer] Queue stopped,  exiting\n");
                 break;
             }
         }
