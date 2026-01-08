@@ -141,11 +141,18 @@ public:
         return rect_;
     }
 
-    // 每一帧调用：画框 + 裁剪
+    // 每一帧调用：裁剪（不绘制红框，因为红框应该在原图上画）
     void get_crop_window(image_buffer_t* src, image_buffer_t* dst)
     {
-        draw_crop_rect(src);
+        // 只执行裁剪，不绘制红框
+        // 红框如果需要，应该在调用此函数前在原图上绘制
         crop_image(src, dst);
+    }
+    
+    // 新增：在原图上绘制裁剪框的接口
+    void draw_crop_window(image_buffer_t* img)
+    {
+        draw_crop_rect(img);
     }
 
     void reset_to_center()
@@ -222,9 +229,9 @@ public:
             float decay_factor = miss_frames_ * 0.1f;
             confidence_ = std::max(0.3f, 1.0f - decay_factor);
             
-            // 跟踪模式下，舒适区稍微放宽（避免抖动）
-            exceed_x *= 0.8f;
-            exceed_y *= 0.8f;
+            // 跟踪模式下，对超出距离进行缩放（避免过度反应）
+            if (exceed_x != 0.0f) exceed_x *= 0.7f;
+            if (exceed_y != 0.0f) exceed_y *= 0.7f;
             
             pred_cx_ = 0.7f * pred_cx_ + 0.3f * (cx_ + exceed_x);
             pred_cy_ = 0.7f * pred_cy_ + 0.3f * (cy_ + exceed_y);
@@ -311,9 +318,9 @@ public:
         pred_cx_ += pred_vx_ * decay;
         pred_cy_ += pred_vy_ * decay;
         
-        // 预测速度也衰减
-        pred_vx_ *= 0.95f;
-        pred_vy_ *= 0.95f;
+        // 垂直方向速度衰减更快（关键！）
+        pred_vx_ *= 0.95f;  // 水平保持
+        pred_vy_ *= 0.90f;  // 垂直快速衰减
         
         // 使用预测位置作为目标
         target_cx_ = pred_cx_;
@@ -323,18 +330,22 @@ public:
         float ex = target_cx_ - cx_;
         float ey = target_cy_ - cy_;
         
-        const float k_p = 0.02f;  // 惯性模式：极低增益
+        // 惯性模式：极低增益，垂直方向更低
+        const float k_p_x = 0.02f;  
+        const float k_p_y = 0.01f;  // 垂直方向增益减半
         const float k_d = 0.97f;  // 高阻尼
-        const float max_v = 30.0f; // 低速度上限
+        const float k_d_y = 0.98f; // 垂直更高阻尼
+        const float max_v_x = 30.0f; 
+        const float max_v_y = 15.0f; // 垂直速度上限减半
         
-        float ax = k_p * ex;
-        float ay = k_p * ey;
+        float ax = k_p_x * ex;
+        float ay = k_p_y * ey;
         
         vx_ = k_d * vx_ + ax;
-        vy_ = k_d * vy_ + ay;
+        vy_ = k_d_y * vy_ + ay;
         
-        vx_ = clamp(vx_, -max_v, max_v);
-        vy_ = clamp(vy_, -max_v, max_v);
+        vx_ = clamp(vx_, -max_v_x, max_v_x);
+        vy_ = clamp(vy_, -max_v_y, max_v_y);
         
         cx_ += vx_;
         cy_ += vy_;
@@ -349,8 +360,10 @@ public:
     
     // ============ 新增：设置舒适区大小 ============
     void set_comfort_zone(float ratio_w, float ratio_h) {
-        comfort_zone_ratio_w_ = clamp(ratio_w, 0.1f, 0.5f);
-        comfort_zone_ratio_h_ = clamp(ratio_h, 0.1f, 0.5f);
+        comfort_zone_ratio_w_ = clamp(ratio_w, 0.05f, 0.50f);  // 限制5%-50%
+        comfort_zone_ratio_h_ = clamp(ratio_h, 0.05f, 0.50f);
+        printf("[INFO] 舒适区设置为: 宽%.1f%%, 高%.1f%%\n", 
+               comfort_zone_ratio_w_ * 100, comfort_zone_ratio_h_ * 100);
     }
     
     // 获取舒适区参数（用于可视化）
@@ -654,7 +667,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     //   0.40 = 较少上下运镜（推荐）
     //   0.45 = 很少上下运镜
     //   0.50 = 几乎不上下运镜
-    crop_win.set_comfort_zone(0.30f, 0.50f);  // 水平20%, 垂直40%
+    crop_win.set_comfort_zone(0.20f, 0.40f);  // 水平20%, 垂直40%
 
     while (true) {
         found_target = false;
@@ -670,6 +683,9 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         }
         
         memset(&crop_image, 0, sizeof(image_buffer_t));
+
+        // 可选：在原图上绘制裁剪框（调试用）
+        // crop_win.draw_crop_window(&src_image);
 
         //获取动态裁切接口
         crop_win.get_crop_window(&src_image, &crop_image);
