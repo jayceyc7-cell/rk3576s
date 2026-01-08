@@ -29,6 +29,8 @@
 #define PIC_FULL_HEIGHT 1440
 #define ALG_CROP_WIDTH 1280
 #define ALG_CROP_HEIGHT 736
+#define VALID_TOP 205  //最小155
+#define VALID_BOTTOM 1085  // 1440 - 155 = 1285
 
 // ===== 全局退出标志 =====
 static std::atomic<bool> g_exit{false};
@@ -562,8 +564,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     
     // 有效区域：顶部 155 到底部 1440-155=1285
     // 即 y ∈ [155, 1285]，高度 1130
-    constexpr int VALID_TOP = 155;
-    constexpr int VALID_BOTTOM = PIC_FULL_HEIGHT - 155;  // 1440 - 155 = 1285
+
     
     SmoothCameraController camera(
         PIC_FULL_WIDTH, 
