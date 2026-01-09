@@ -720,8 +720,10 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                                    det->box.right - det->box.left, 
                                    det->box.bottom - det->box.top, 
                                    COLOR_BLUE, 3);
+                                   
+                    draw_text(&src_image, text, det->box.left, det->box.top - 20, COLOR_RED, 10);
 
-                    // 跟踪处理
+                    // 跟踪处理（全图模式：坐标已经是原图坐标）
                     std::vector<T_DetectObject> detections;
                     for (int k = 0; k < od_results.count; k++) {
                         auto &det_obj = od_results.results[k];
@@ -740,7 +742,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                     }
 
                     std::vector<T_TrackObject> track_results;
-                    // 注意：全图模式下，跟踪器处理的是全图
+                    // 全图模式：使用原图进行跟踪，坐标已经是原图坐标
                     tracker.ProcessFrame(frame_track_count, src_image, detections, track_results);
 
                     if (!track_results.empty()) {
@@ -805,7 +807,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                     draw_rectangle(&crop_image_buf, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
                     draw_text(&crop_image_buf, text, x1, y1 - 20, COLOR_RED, 10);
 
-                    // 跟踪处理
+                    // 跟踪处理（裁剪模式：先将检测坐标转换为原图坐标）
                     std::vector<T_DetectObject> detections;
                     for (int k = 0; k < od_results.count; k++) {
                         auto &det_obj = od_results.results[k];
@@ -816,38 +818,41 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                         T_DetectObject obj;
                         obj.cls_id = det_obj.cls_id;
                         obj.score = det_obj.prop;
-                        obj.xmin = det_obj.box.left;
-                        obj.ymin = det_obj.box.top;
-                        obj.xmax = det_obj.box.right;
-                        obj.ymax = det_obj.box.bottom;
+                        // 裁剪图坐标 → 原图坐标
+                        obj.xmin = camera.get_rect().left + det_obj.box.left;
+                        obj.ymin = camera.get_rect().top + det_obj.box.top;
+                        obj.xmax = camera.get_rect().left + det_obj.box.right;
+                        obj.ymax = camera.get_rect().top + det_obj.box.bottom;
                         detections.push_back(obj);
                     }
 
                     std::vector<T_TrackObject> track_results;
-                    tracker.ProcessFrame(frame_track_count, crop_image_buf, detections, track_results);
+                    // 裁剪模式：使用原图进行跟踪，坐标已转换为原图坐标
+                    tracker.ProcessFrame(frame_track_count, src_image, detections, track_results);
 
                     printf("[Consumer][CROP] track_results.size() = %zu\n", track_results.size());
                     
                     if (!track_results.empty()) {
                         auto &t = track_results[0];
                         
+                        // 跟踪结果是原图坐标，转换为裁剪图坐标用于绘制
+                        int crop_xmin = t.xmin - camera.get_rect().left;
+                        int crop_ymin = t.ymin - camera.get_rect().top;
+                        int crop_xmax = t.xmax - camera.get_rect().left;
+                        int crop_ymax = t.ymax - camera.get_rect().top;
+                        
                         draw_rectangle(&crop_image_buf, 
-                                       t.xmin, t.ymin,
-                                       t.xmax - t.xmin, 
-                                       t.ymax - t.ymin, 
+                                       crop_xmin, crop_ymin,
+                                       crop_xmax - crop_xmin, 
+                                       crop_ymax - crop_ymin, 
                                        COLOR_GREEN, 3);
 
-                        // 裁剪图坐标 → 原图坐标
-                        int oxmin = camera.get_rect().left + t.xmin;
-                        int oymin = camera.get_rect().top + t.ymin;
-                        int oxmax = camera.get_rect().left + t.xmax;
-                        int oymax = camera.get_rect().top + t.ymax;
-
-                        camera.update_by_target(oxmin, oymin, oxmax, oymax);
+                        // 跟踪结果已经是原图坐标，直接更新运镜
+                        camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
                         
-                        printf("[Consumer][CROP] Track @ crop(%d %d %d %d) -> full(%d %d %d %d)\n",
+                        printf("[Consumer][CROP] Track @ full(%d %d %d %d) -> crop(%d %d %d %d)\n",
                                t.xmin, t.ymin, t.xmax, t.ymax,
-                               oxmin, oymin, oxmax, oymax);
+                               crop_xmin, crop_ymin, crop_xmax, crop_ymax);
                     }
                     break;
                 }
