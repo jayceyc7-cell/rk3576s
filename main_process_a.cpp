@@ -362,13 +362,13 @@ private:
     bool has_target_{false};
     int frames_without_target_{0};
 
-    const float stiffness_ = 0.04f;
-    const float damping_ = 0.4f;
-    const float max_speed_ = 30.0f;
-    const float max_accel_ = 3.0f;
-    const float dead_zone_ratio_ = 0.15f;
-    const float prediction_frames_ = 3.0f;
-    const float velocity_smooth_ = 0.3f;
+    const float stiffness_ = 0.02f;
+    const float damping_ = 0.5f;
+    const float max_speed_ = 20.0f;
+    const float max_accel_ = 1.5f;
+    const float dead_zone_ratio_ = 0.20f;
+    const float prediction_frames_ = 2.0f;
+    const float velocity_smooth_ = 0.25f;
     const int return_to_center_delay_ = 60;
     const float return_to_center_speed_ = 0.01f;
 
@@ -647,14 +647,9 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     int frame_track_count = 0;
     image_buffer_t src_image = {0};
     image_buffer_t crop_image_buf = {0};
-    image_buffer_t detect_image_buf = {0};  // 用于检测的图像（裁剪或全图）
     
     TrackFrame tracker;
     tracker.Init(50);
-    
-    // // 有效区域设置
-    // constexpr int VALID_TOP = 205;
-    // constexpr int VALID_BOTTOM = 1085;
     
     SmoothCameraController camera(
         PIC_FULL_WIDTH, 
@@ -665,7 +660,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         VALID_BOTTOM
     );
 
-    // 检测区域管理器：连续 15 帧丢失切全图，全图下连续 3 帧找到切回裁剪
     DetectionAreaManager detect_manager(15, 3);
 
     printf("[Consumer] Detection mode: CROP=%dx%d, FULLFRAME=%dx%d\n",
@@ -674,7 +668,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     while (true) {
         frame_track_count++;
         
-        // 获取新帧
         if (src_image.width == 0 && src_image.height == 0) {
             memset(&src_image, 0, sizeof(image_buffer_t));
             if (!fq.pop(src_image)) {
@@ -684,93 +677,45 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         }
         
         memset(&crop_image_buf, 0, sizeof(image_buffer_t));
-        memset(&detect_image_buf, 0, sizeof(image_buffer_t));
 
         bool is_fullframe_mode = detect_manager.is_fullframe_mode();
         bool found_ball = false;
         object_detect_result_list od_results;
 
+        // ===== 公共变量：存储检测和跟踪结果（原图坐标）=====
+        std::vector<T_DetectObject> ball_detections;  // 球的检测结果（原图坐标）
+        std::vector<T_TrackObject> track_results;     // 跟踪结果（原图坐标）
+
         if (is_fullframe_mode) {
             // ===== 全图检测模式 =====
-            // 1. 更新相机位置并在原图上绘制裁剪框
             camera.update_and_draw_only(&src_image);
-            
-            // 2. 直接对全图进行推理
             inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
             
-            // 3. 处理检测结果
-            char text[256];
+            // 提取球的检测结果（已经是原图坐标）
             for (int j = 0; j < od_results.count; j++) {
                 object_detect_result *det = &(od_results.results[j]);
-                
-                snprintf(text, sizeof(text), "%s %.1f%%", 
-                         coco_cls_to_name(det->cls_id), det->prop * 100);
+                char text[64];
+                snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
                 
                 if (strncmp(text, "ball", 4) == 0) {
                     found_ball = true;
                     
-                    printf("[Consumer][FULLFRAME] Found ball @ (%d %d %d %d) %.3f\n",
-                           det->box.left, det->box.top,
-                           det->box.right, det->box.bottom,
-                           det->prop);
-
-                    // 在原图上绘制检测框（蓝色）
-                    draw_rectangle(&src_image, 
-                                   det->box.left, det->box.top,
-                                   det->box.right - det->box.left, 
-                                   det->box.bottom - det->box.top, 
-                                   COLOR_BLUE, 3);
-                                   
-                    draw_text(&src_image, text, det->box.left, det->box.top - 20, COLOR_RED, 10);
-
-                    // 跟踪处理（全图模式：坐标已经是原图坐标）
-                    std::vector<T_DetectObject> detections;
-                    for (int k = 0; k < od_results.count; k++) {
-                        auto &det_obj = od_results.results[k];
-                        char tmp[64];
-                        snprintf(tmp, sizeof(tmp), "%s", coco_cls_to_name(det_obj.cls_id));
-                        if (strncmp(tmp, "ball", 4) != 0) continue;
-
-                        T_DetectObject obj;
-                        obj.cls_id = det_obj.cls_id;
-                        obj.score = det_obj.prop;
-                        obj.xmin = det_obj.box.left;
-                        obj.ymin = det_obj.box.top;
-                        obj.xmax = det_obj.box.right;
-                        obj.ymax = det_obj.box.bottom;
-                        detections.push_back(obj);
-                    }
-
-                    std::vector<T_TrackObject> track_results;
-                    // 全图模式：使用原图进行跟踪，坐标已经是原图坐标
-                    tracker.ProcessFrame(frame_track_count, src_image, detections, track_results);
-
-                    if (!track_results.empty()) {
-                        auto &t = track_results[0];
-                        
-                        // 在原图上绘制跟踪框（绿色）
-                        draw_rectangle(&src_image, 
-                                       t.xmin, t.ymin,
-                                       t.xmax - t.xmin, 
-                                       t.ymax - t.ymin, 
-                                       COLOR_GREEN, 3);
-
-                        // 全图坐标直接更新运镜
-                        camera.update_by_fullframe_target(t.xmin, t.ymin, t.xmax, t.ymax);
-                        
-                        printf("[Consumer][FULLFRAME] Track @ (%d %d %d %d)\n",
-                               t.xmin, t.ymin, t.xmax, t.ymax);
-                    }
-                    break;
+                    T_DetectObject obj;
+                    obj.cls_id = det->cls_id;
+                    obj.score = det->prop;
+                    obj.xmin = det->box.left;
+                    obj.ymin = det->box.top;
+                    obj.xmax = det->box.right;
+                    obj.ymax = det->box.bottom;
+                    ball_detections.push_back(obj);
                 }
             }
-
-            // 4. 裁剪出输出图像（始终输出 1280x736）
+            
+            // 裁剪输出图像
             camera.crop_current_window(&src_image, &crop_image_buf);
 
         } else {
-            // ===== 裁剪区域检测模式（正常模式）=====
-            // 1. 获取裁剪窗口
+            // ===== 裁剪区域检测模式 =====
             camera.get_crop_window(&src_image, &crop_image_buf);
 
             if (crop_image_buf.virt_addr == NULL) {
@@ -780,83 +725,101 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                 continue;
             }
 
-            // 2. 对裁剪图进行推理
             inference_yolov8_model(&rknn_app_ctx, &crop_image_buf, &od_results);
 
-            // 3. 处理检测结果
-            char text[256];
+            // 提取球的检测结果，并转换为原图坐标
             for (int j = 0; j < od_results.count; j++) {
                 object_detect_result *det = &(od_results.results[j]);
-
-                int x1 = det->box.left;
-                int y1 = det->box.top;
-                int x2 = det->box.right;
-                int y2 = det->box.bottom;
-
-                snprintf(text, sizeof(text), "%s %.1f%%", 
-                         coco_cls_to_name(det->cls_id), det->prop * 100);
+                char text[64];
+                snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
                 
                 if (strncmp(text, "ball", 4) == 0) {
                     found_ball = true;
                     
-                    printf("[Consumer][CROP] Found ball @ (%d %d %d %d) %.3f\n",
-                           det->box.left, det->box.top,
-                           det->box.right, det->box.bottom,
-                           det->prop);
-
-                    draw_rectangle(&crop_image_buf, x1, y1, (x2 - x1), (y2 - y1), COLOR_BLUE, 3);
-                    draw_text(&crop_image_buf, text, x1, y1 - 20, COLOR_RED, 10);
-
-                    // 跟踪处理（裁剪模式：先将检测坐标转换为原图坐标）
-                    std::vector<T_DetectObject> detections;
-                    for (int k = 0; k < od_results.count; k++) {
-                        auto &det_obj = od_results.results[k];
-                        char tmp[64];
-                        snprintf(tmp, sizeof(tmp), "%s", coco_cls_to_name(det_obj.cls_id));
-                        if (strncmp(tmp, "ball", 4) != 0) continue;
-
-                        T_DetectObject obj;
-                        obj.cls_id = det_obj.cls_id;
-                        obj.score = det_obj.prop;
-                        // 裁剪图坐标 → 原图坐标
-                        obj.xmin = camera.get_rect().left + det_obj.box.left;
-                        obj.ymin = camera.get_rect().top + det_obj.box.top;
-                        obj.xmax = camera.get_rect().left + det_obj.box.right;
-                        obj.ymax = camera.get_rect().top + det_obj.box.bottom;
-                        detections.push_back(obj);
-                    }
-
-                    std::vector<T_TrackObject> track_results;
-                    // 裁剪模式：使用原图进行跟踪，坐标已转换为原图坐标
-                    tracker.ProcessFrame(frame_track_count, src_image, detections, track_results);
-
-                    printf("[Consumer][CROP] track_results.size() = %zu\n", track_results.size());
-                    
-                    if (!track_results.empty()) {
-                        auto &t = track_results[0];
-                        
-                        // 跟踪结果是原图坐标，转换为裁剪图坐标用于绘制
-                        int crop_xmin = t.xmin - camera.get_rect().left;
-                        int crop_ymin = t.ymin - camera.get_rect().top;
-                        int crop_xmax = t.xmax - camera.get_rect().left;
-                        int crop_ymax = t.ymax - camera.get_rect().top;
-                        
-                        draw_rectangle(&crop_image_buf, 
-                                       crop_xmin, crop_ymin,
-                                       crop_xmax - crop_xmin, 
-                                       crop_ymax - crop_ymin, 
-                                       COLOR_GREEN, 3);
-
-                        // 跟踪结果已经是原图坐标，直接更新运镜
-                        camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
-                        
-                        printf("[Consumer][CROP] Track @ full(%d %d %d %d) -> crop(%d %d %d %d)\n",
-                               t.xmin, t.ymin, t.xmax, t.ymax,
-                               crop_xmin, crop_ymin, crop_xmax, crop_ymax);
-                    }
-                    break;
+                    T_DetectObject obj;
+                    obj.cls_id = det->cls_id;
+                    obj.score = det->prop;
+                    // 裁剪图坐标 → 原图坐标
+                    obj.xmin = camera.get_rect().left + det->box.left;
+                    obj.ymin = camera.get_rect().top + det->box.top;
+                    obj.xmax = camera.get_rect().left + det->box.right;
+                    obj.ymax = camera.get_rect().top + det->box.bottom;
+                    ball_detections.push_back(obj);
                 }
             }
+        }
+
+        // ===== 统一的跟踪处理（始终使用原图坐标）=====
+        if (!ball_detections.empty() || tracker.HasActiveTrack()) {
+            tracker.ProcessFrame(frame_track_count, ball_detections, track_results);
+        }
+
+        // ===== 统一的绘图处理（在裁剪图上绘制）=====
+        if (crop_image_buf.virt_addr != NULL) {
+            // 绘制检测框（蓝色）
+            for (const auto& det : ball_detections) {
+                // 原图坐标 → 裁剪图坐标
+                int crop_x1 = det.xmin - camera.get_rect().left;
+                int crop_y1 = det.ymin - camera.get_rect().top;
+                int crop_x2 = det.xmax - camera.get_rect().left;
+                int crop_y2 = det.ymax - camera.get_rect().top;
+                
+                // 检查是否在裁剪框内
+                if (crop_x1 >= 0 && crop_y1 >= 0 && 
+                    crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
+                    
+                    draw_rectangle(&crop_image_buf, 
+                                   crop_x1, crop_y1,
+                                   crop_x2 - crop_x1, crop_y2 - crop_y1,
+                                   COLOR_BLUE, 3);
+                    
+                    char text[64];
+                    snprintf(text, sizeof(text), "ball %.1f%%", det.score * 100);
+                    draw_text(&crop_image_buf, text, crop_x1, crop_y1 - 20, COLOR_RED, 10);
+                }
+            }
+            
+            // 绘制跟踪框（绿色）
+            for (const auto& trk : track_results) {
+                // 原图坐标 → 裁剪图坐标
+                int crop_x1 = trk.xmin - camera.get_rect().left;
+                int crop_y1 = trk.ymin - camera.get_rect().top;
+                int crop_x2 = trk.xmax - camera.get_rect().left;
+                int crop_y2 = trk.ymax - camera.get_rect().top;
+                
+                // 检查是否在裁剪框内
+                if (crop_x1 >= 0 && crop_y1 >= 0 && 
+                    crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
+                    
+                    draw_rectangle(&crop_image_buf, 
+                                   crop_x1, crop_y1,
+                                   crop_x2 - crop_x1, crop_y2 - crop_y1,
+                                   COLOR_GREEN, 3);
+                    
+                    // 标记是否为预测框
+                    if (trk.is_predicted) {
+                        draw_text(&crop_image_buf, "[PRED]", crop_x1, crop_y1 - 40, COLOR_YELLOW, 10);
+                    }
+                }
+            }
+            
+            // 绘制调试信息
+            char debug_text[128];
+            snprintf(debug_text, sizeof(debug_text), "Mode:%s Dist:%.1f Miss:%d",
+                     is_fullframe_mode ? "FULL" : "CROP",
+                     tracker.GetLastGatingDistance(),
+                     tracker.GetMissCount());
+            draw_text(&crop_image_buf, debug_text, 10, 20, COLOR_YELLOW, 12);
+        }
+
+        // ===== 更新运镜 =====
+        if (!track_results.empty()) {
+            auto &t = track_results[0];
+            camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
+            
+            printf("[Consumer] Track @ full(%.0f %.0f %.0f %.0f) %s\n",
+                   t.xmin, t.ymin, t.xmax, t.ymax,
+                   t.is_predicted ? "[PREDICTED]" : "[MATCHED]");
         }
 
         // ===== 更新检测模式 =====
@@ -864,9 +827,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         
         if (!found_ball) {
             camera.mark_no_target();
-            printf("[Consumer] No ball found, consecutive lost: %d, mode: %s\n",
-                   detect_manager.get_consecutive_lost(),
-                   detect_manager.is_fullframe_mode() ? "FULLFRAME" : "CROP");
         }
 
         // ===== 保存输出 =====
@@ -884,7 +844,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                    detect_manager.is_fullframe_mode() ? "FULLFRAME" : "CROP");
         }
         
-        // ===== 释放内存 =====
         if (crop_image_buf.virt_addr) {
             free(crop_image_buf.virt_addr);
             crop_image_buf.virt_addr = NULL;

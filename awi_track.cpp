@@ -1,110 +1,162 @@
 #include "awi_track.hpp"
 #include <iostream>
-#include "queue"
-#include "threadpool.h"
 #include "BallTrack.h"
-#include "common.h"
-#include "image_drawing.h"
 
-
-// ======================= 参数配置 =======================
-static constexpr int   MAX_MISS_COUNT = 2;
-static const float GATE_THRESHOLD = 200.0f;
-BallTrack *g_ball_ = nullptr; // 使用指针保持全局状态（多帧间保持滤波状态）
-int miss_count_ = 0;             // 连续未匹配帧数
-
-TrackFrame::TrackFrame() {
-    std::cout << "TrackFrame!!!" << std::endl;
+TrackFrame::TrackFrame()
+    : max_track_num_(50),
+      next_track_id_(0),
+      current_frame_id_(0),
+      ball_tracker_(nullptr),
+      miss_count_(0),
+      last_gating_distance_(0.0f),
+      max_miss_count_(2),        // 可配置：最大丢失帧数
+      gate_threshold_(200.0f)    // 可配置：马氏距离阈值
+{
+    std::cout << "TrackFrame created" << std::endl;
 }
 
 TrackFrame::~TrackFrame()
 {
-    std::cout << "~TrackFrame!!!" << std::endl;
     DeInit();
+    std::cout << "TrackFrame destroyed" << std::endl;
 }
 
-// ======================= Init / Reset / DeInit =======================
 bool TrackFrame::Init(int max_track_num)
 {
-    max_track_num_   = max_track_num;
-    next_track_id_   = 0;
+    max_track_num_ = max_track_num;
+    next_track_id_ = 0;
     current_frame_id_ = 0;
-
-    tracks_.clear();
-    output_tracks_.clear();
-
+    miss_count_ = 0;
+    last_gating_distance_ = 0.0f;
+    
+    // 清理旧的跟踪器
+    if (ball_tracker_ != nullptr) {
+        delete ball_tracker_;
+        ball_tracker_ = nullptr;
+    }
+    
     return true;
 }
 
 void TrackFrame::Reset()
 {
-    tracks_.clear();
-    output_tracks_.clear();
-
-    next_track_id_    = 0;
+    if (ball_tracker_ != nullptr) {
+        delete ball_tracker_;
+        ball_tracker_ = nullptr;
+    }
+    
+    next_track_id_ = 0;
     current_frame_id_ = 0;
+    miss_count_ = 0;
+    last_gating_distance_ = 0.0f;
 }
 
 void TrackFrame::DeInit()
 {
-    tracks_.clear();
-    output_tracks_.clear();
+    if (ball_tracker_ != nullptr) {
+        delete ball_tracker_;
+        ball_tracker_ = nullptr;
+    }
+    
     max_track_num_ = 0;
+    miss_count_ = 0;
 }
-
 
 void TrackFrame::ProcessFrame(
     uint64_t frame_id,
-    image_buffer_t& src_image,
     const std::vector<T_DetectObject>& detections,
     std::vector<T_TrackObject>& track_results)
 {
-    printf("[ProcessFrame] frame_id=%lu, det_num=%zu\n",
-           frame_id, detections.size());
-
+    current_frame_id_ = frame_id;
     track_results.clear();
+    last_gating_distance_ = -1.0f;
+
+    printf("[TrackFrame] frame_id=%lu, det_num=%zu, miss_count=%d\n",
+           frame_id, detections.size(), miss_count_);
 
     // =====================================================
-    // 1. 只筛选 cls_id == 0（篮球） 
-    // 2025-12-25:在篮球的筛选中，可能检测到多个篮球，此时为每一个篮球都创建一个轨迹，而后对每一个轨迹放入筛选器筛选，筛选器主要作用是筛选出需要跟踪的主篮球轨迹，干扰篮球轨迹需要删除。
+    // 1. 筛选 cls_id == 0（篮球），选择最佳候选
     // =====================================================
     const T_DetectObject* ball_det = nullptr;
-    for (const auto& det : detections)
-    {
-        if (det.cls_id == 0)
-        {
-            ball_det = &det;
-            break;   // 单目标，取第一个即可
+    
+    if (ball_tracker_ == nullptr) {
+        // 没有跟踪器时，选置信度最高的球
+        float best_score = 0.0f;
+        for (const auto& det : detections) {
+            if (det.cls_id == 0 && det.score > best_score) {
+                best_score = det.score;
+                ball_det = &det;
+            }
+        }
+    } else {
+        // 有跟踪器时，选马氏距离最小的球
+        float best_dist = 1e9f;
+        for (const auto& det : detections) {
+            if (det.cls_id != 0) continue;
+            
+            float w = det.xmax - det.xmin;
+            float h = det.ymax - det.ymin;
+            float cx = det.xmin + w * 0.5f;
+            float cy = det.ymin + h * 0.5f;
+            float a = w / h;
+            
+            std::vector<float> xyah = {cx, cy, a, h};
+            std::vector<DETECTBOX> dets = {
+                Eigen::Map<DETECTBOX>(xyah.data())
+            };
+            
+            auto maha = kf_.gating_distance(
+                ball_tracker_->get_mean(),
+                ball_tracker_->get_covariance(),
+                dets,
+                false
+            );
+            
+            float dist = maha(0);
+            if (dist < best_dist) {
+                best_dist = dist;
+                ball_det = &det;
+                last_gating_distance_ = dist;  // 记录最佳距离
+            }
+        }
+        
+        // 如果最佳距离也超过阈值，说明没有合适的匹配
+        if (best_dist > gate_threshold_) {
+            printf("[TrackFrame] Best distance %.2f > threshold %.2f, treating as no detection\n",
+                   best_dist, gate_threshold_);
+            ball_det = nullptr;  // 当作没有检测
         }
     }
 
     // =====================================================
-    // 2. 若本帧没有篮球检测
+    // 2. 若本帧没有合适的篮球检测
     // =====================================================
-    if (ball_det == nullptr)
-    {
-        printf("[INFO] No cls_id == 0 detected\n");
+    if (ball_det == nullptr) {
+        printf("[TrackFrame] No suitable ball detected this frame\n");
 
-        if (g_ball_ != nullptr)
-        {
+        if (ball_tracker_ != nullptr) {
             miss_count_++;
 
-            // 仅预测
-            g_ball_->predict(g_kf);
+            ball_tracker_->predict(kf_);
+            auto pred = ball_tracker_->get_tlwh();
 
-            auto pred = g_ball_->get_tlwh();
-            draw_rectangle(&src_image,
-                           pred[0], pred[1], pred[2], pred[3],
-                           COLOR_GREEN, 3);
+            T_TrackObject track;
+            track.track_id = 0;
+            track.cls_id = 0;
+            track.xmin = pred[0];
+            track.ymin = pred[1];
+            track.xmax = pred[0] + pred[2];
+            track.ymax = pred[1] + pred[3];
+            track.is_predicted = true;
+            track_results.push_back(track);
 
-            printf("[PREDICT ONLY] miss_count=%d\n", miss_count_);
+            printf("[TrackFrame] Predict only: (%.1f, %.1f, %.1f, %.1f), miss=%d/%d\n",
+                   pred[0], pred[1], pred[2], pred[3], miss_count_, max_miss_count_);
 
-            // 超过最大丢失帧，重置 tracker
-            if (miss_count_ >= MAX_MISS_COUNT)
-            {
-                printf("[RESET] tracker reset (no detection)\n");
-                delete g_ball_;
-                g_ball_ = nullptr;
+            if (miss_count_ >= max_miss_count_) {
+                printf("[TrackFrame] Reset tracker (max miss reached)\n");
+                delete ball_tracker_;
+                ball_tracker_ = nullptr;
                 miss_count_ = 0;
             }
         }
@@ -112,137 +164,68 @@ void TrackFrame::ProcessFrame(
     }
 
     // =====================================================
-    // 3. 取篮球检测框
+    // 3. 有合适的检测，提取检测框
     // =====================================================
     const auto& det = *ball_det;
-
     float xmin = det.xmin;
     float ymin = det.ymin;
     float xmax = det.xmax;
     float ymax = det.ymax;
-
     float w = xmax - xmin;
     float h = ymax - ymin;
 
     std::vector<float> tlwh = {xmin, ymin, w, h};
 
-    // =====================================================
-    // 4. 初始化 tracker（第一帧）
-    // =====================================================
-    if (g_ball_ == nullptr)
-    {
-        g_ball_ = new BallTrack(tlwh);
-        g_ball_->init(g_kf);
-        miss_count_ = 0;
+    printf("[TrackFrame] Selected detection: (%.1f, %.1f, %.1f, %.1f) score=%.2f\n", 
+           xmin, ymin, w, h, det.score);
 
-        printf("[INIT] BallTrack initialized (cls_id=0)\n");
+    // =====================================================
+    // 4. 初始化跟踪器
+    // =====================================================
+    if (ball_tracker_ == nullptr) {
+        ball_tracker_ = new BallTrack(tlwh);
+        ball_tracker_->init(kf_);
+        miss_count_ = 0;
+        last_gating_distance_ = 0.0f;
+        
+        printf("[TrackFrame] Tracker initialized\n");
+        
+        T_TrackObject track;
+        track.track_id = 0;
+        track.cls_id = 0;
+        track.xmin = xmin;
+        track.ymin = ymin;
+        track.xmax = xmax;
+        track.ymax = ymax;
+        track.is_predicted = false;
+        track_results.push_back(track);
         return;
     }
 
     // =====================================================
-    // 5. gating 距离计算（Mahalanobis）
+    // 5. 更新（已经在上面选择时计算过距离，且通过了阈值检查）
     // =====================================================
-    float cx = xmin + w * 0.5f;
-    float cy = ymin + h * 0.5f;
-    float a  = w / h;
-
-    std::vector<float> xyah = {cx, cy, a, h};
-    std::vector<DETECTBOX> dets = {
-        Eigen::Map<DETECTBOX>(xyah.data())
-    };
-
-    auto maha = g_kf.gating_distance(
-        g_ball_->get_mean(),
-        g_ball_->get_covariance(),
-        dets,
-        false
-    );
-
-    float dist = maha(0);
-    printf("[GATE] Mahalanobis distance = %.2f\n", dist);
-    // 构造要显示的文本
-    char text_buf[128];
-    snprintf(text_buf, sizeof(text_buf),
-             "Dist: %.2f  Miss: %d",
-             dist, miss_count_);
+    ball_tracker_->update(kf_, tlwh);
+    miss_count_ = 0;
+    printf("[TrackFrame] Update: MATCHED (dist=%.2f)\n", last_gating_distance_);
 
     // =====================================================
-    // 6. update 或 miss
+    // 6. 预测
     // =====================================================
-    if (dist <= GATE_THRESHOLD)
-    {
-        g_ball_->update(g_kf, tlwh);
-        miss_count_ = 0;
-        draw_text(&src_image,
-                  text_buf,
-                  10, 40,
-                  COLOR_YELLOW, 20);
+    ball_tracker_->predict(kf_);
 
-        draw_text(&src_image,
-                  "[Update MATCH]",
-                  10, 80,
-                  COLOR_YELLOW, 20);
-    }
-    else
-    {
-        miss_count_++;
-        snprintf(text_buf, sizeof(text_buf),
-                 "Dist: %.2f  Miss: %d",
-                 dist, miss_count_);
-        draw_text(&src_image,
-                  text_buf,
-                  10, 40,
-                  COLOR_YELLOW, 20);
-
-        draw_text(&src_image,
-                  "[Update MATCH]",
-                  10, 80,
-                  COLOR_YELLOW, 20);
-    }
-
-    // =====================================================
-    // 7. predict
-    // =====================================================
-    g_ball_->predict(g_kf);
-
-    auto pred = g_ball_->get_tlwh();
-    float pred_xmin = pred[0];
-    float pred_ymin = pred[1];
-    float pred_w    = pred[2];
-    float pred_h    = pred[3];
-    //更新轨迹
+    auto pred = ball_tracker_->get_tlwh();
+    
     T_TrackObject track;
-    track.track_id = 0; //篮球轨迹id，暂时取第一个，多个轨迹时需要修改id号
-    track.cls_id = 0; // 篮球类别的id为0
+    track.track_id = 0;
+    track.cls_id = 0;
     track.xmin = pred[0];
     track.ymin = pred[1];
     track.xmax = pred[0] + pred[2];
     track.ymax = pred[1] + pred[3];
+    track.is_predicted = false;
     track_results.push_back(track);
 
-    draw_rectangle(&src_image,
-                   pred_xmin, pred_ymin,
-                   pred_w, pred_h,
-                   COLOR_GREEN, 3);
-
-    printf("[PREDICT] x=%.2f y=%.2f w=%.2f h=%.2f\n",
-           pred_xmin, pred_ymin, pred_w, pred_h);
-    
-    draw_text(&src_image,
-              "BallTrack info:",
-              10, 10,
-              COLOR_YELLOW, 20);
-
-    // =====================================================
-    // 8. 连续丢失 → reset
-    // =====================================================
-    if (miss_count_ >= MAX_MISS_COUNT)
-    {
-        printf("[RESET] tracker reset (miss overflow)\n");
-        delete g_ball_;
-        g_ball_ = nullptr;
-        miss_count_ = 0;
-    }
+    printf("[TrackFrame] Output: (%.1f, %.1f, %.1f, %.1f)\n",
+           pred[0], pred[1], pred[2], pred[3]);
 }
-
-
