@@ -25,8 +25,10 @@
 #include "awi_track.hpp"
 
 /*--------------------------------------*/
-#define PIC_FULL_WIDTH 2560
+#define PIC_FULL_WIDTH 4608
 #define PIC_FULL_HEIGHT 1440
+// #define PIC_FULL_WIDTH 2560
+// #define PIC_FULL_HEIGHT 1440
 #define ALG_CROP_WIDTH 1280
 #define ALG_CROP_HEIGHT 736
 #define VALID_TOP 205  //最小155
@@ -874,7 +876,12 @@ int main(int argc, char* argv[])
 
     constexpr size_t QUEUE_SIZE = 12;
     constexpr size_t POOL_SIZE  = 16;
-    constexpr size_t IMAGE_SIZE = 2560 * 1440 * 3;
+    
+    // ✅ 修改这一行：使用宏定义，自动适配不同分辨率
+    constexpr size_t IMAGE_SIZE = PIC_FULL_WIDTH * PIC_FULL_HEIGHT * 3;
+    
+    printf("[Main] Image buffer size: %zu bytes (%.2f MB) for %dx%d\n",
+           IMAGE_SIZE, IMAGE_SIZE / 1024.0 / 1024.0, PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
 
     signal(SIGINT, signal_handler);
 
