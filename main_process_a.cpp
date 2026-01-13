@@ -25,10 +25,10 @@
 #include "awi_track.hpp"
 
 /*--------------------------------------*/
-#define PIC_FULL_WIDTH 4608
-#define PIC_FULL_HEIGHT 1440
-// #define PIC_FULL_WIDTH 2560
+// #define PIC_FULL_WIDTH 4608
 // #define PIC_FULL_HEIGHT 1440
+#define PIC_FULL_WIDTH 2560
+#define PIC_FULL_HEIGHT 1440
 #define ALG_CROP_WIDTH 1280
 #define ALG_CROP_HEIGHT 736
 #define VALID_TOP 205  //最小155
@@ -628,7 +628,414 @@ void producer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *frames_d
 
     printf("[Producer] Finished reading all %zu frames\n", i);
 }
-/*-------------------------------------------------*/
+
+/*------------------------------------------------*/
+/**
+ * 球目标筛选器 - 排除干扰球，锁定目标球
+ */
+class BallSelector {
+public:
+    struct BallCandidate {
+        T_DetectObject det;
+        float distance_to_tracker;  // 与当前跟踪的距离
+        bool is_static;             // 是否为静止球
+        int static_frames;          // 静止帧数
+        float priority_score;       // 综合优先级分数
+    };
+
+    BallSelector(int valid_left, int valid_right, int valid_top, int valid_bottom)
+        : valid_left_(valid_left),
+          valid_right_(valid_right),
+          valid_top_(valid_top),
+          valid_bottom_(valid_bottom)
+    {
+    }
+
+    /**
+     * 从多个检测结果中选择目标球
+     * @param detections 所有球的检测结果
+     * @param tracker_prediction 跟踪器预测位置（如果有）
+     * @param has_tracker 是否有活跃的跟踪器
+     * @return 选中的目标球，如果没有合适的返回 nullptr
+     */
+    const T_DetectObject* select_target_ball(
+        const std::vector<T_DetectObject>& detections,
+        const T_TrackObject* tracker_prediction,
+        bool has_tracker)
+    {
+        if (detections.empty()) {
+            return nullptr;
+        }
+
+        // 如果只有一个检测，直接返回（如果在有效区域内）
+        if (detections.size() == 1) {
+            if (is_in_valid_region(detections[0])) {
+                update_history(detections[0]);
+                return &detections[0];
+            }
+            return nullptr;
+        }
+
+        // 多个检测，需要筛选
+        std::vector<BallCandidate> candidates;
+        
+        for (const auto& det : detections) {
+            BallCandidate candidate;
+            candidate.det = det;
+            candidate.distance_to_tracker = 1e9f;
+            candidate.is_static = false;
+            candidate.static_frames = 0;
+            candidate.priority_score = 0.0f;
+
+            // 第1层：区域过滤
+            if (!is_in_valid_region(det)) {
+                continue;  // 跳过有效区域外的球
+            }
+
+            // 第2层：静止球检测
+            check_static_ball(det, candidate);
+            if (candidate.is_static && candidate.static_frames > static_threshold_) {
+                continue;  // 跳过静止超过阈值的球
+            }
+
+            // 第3层：计算与跟踪器的距离
+            if (has_tracker && tracker_prediction != nullptr) {
+                candidate.distance_to_tracker = calculate_distance(det, *tracker_prediction);
+            }
+
+            // 计算综合优先级分数
+            candidate.priority_score = calculate_priority(candidate, has_tracker);
+
+            candidates.push_back(candidate);
+        }
+
+        if (candidates.empty()) {
+            return nullptr;
+        }
+
+        // 按优先级排序，选择最高的
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const BallCandidate& a, const BallCandidate& b) {
+                      return a.priority_score > b.priority_score;
+                  });
+
+        // 更新历史记录
+        update_history(candidates[0].det);
+
+        // 返回原始 detections 中对应的指针
+        for (const auto& det : detections) {
+            if (det.xmin == candidates[0].det.xmin &&
+                det.ymin == candidates[0].det.ymin) {
+                return &det;
+            }
+        }
+
+        return nullptr;
+    }
+
+    /**
+     * 重置历史记录（场景切换时调用）
+     */
+    void reset() {
+        ball_history_.clear();
+    }
+
+private:
+    // 有效区域边界
+    int valid_left_;
+    int valid_right_;
+    int valid_top_;
+    int valid_bottom_;
+
+    // 静止检测阈值
+    static constexpr int static_threshold_ = 30;      // 静止超过30帧视为干扰球
+    static constexpr float static_move_threshold_ = 10.0f;  // 移动小于10像素视为静止
+
+    // 历史检测记录（用于静止球检测）
+    struct BallHistory {
+        float cx, cy;           // 中心位置
+        int static_count;       // 静止计数
+        int last_seen_frame;    // 最后出现帧
+    };
+    std::vector<BallHistory> ball_history_;
+    int current_frame_ = 0;
+
+    /**
+     * 检查是否在有效区域内
+     */
+    bool is_in_valid_region(const T_DetectObject& det) {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        return (cx >= valid_left_ && cx <= valid_right_ &&
+                cy >= valid_top_ && cy <= valid_bottom_);
+    }
+
+    /**
+     * 检查是否为静止球
+     */
+    void check_static_ball(const T_DetectObject& det, BallCandidate& candidate) {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+
+        // 查找历史记录中是否有相近位置的球
+        for (auto& hist : ball_history_) {
+            float dist = std::sqrt((cx - hist.cx) * (cx - hist.cx) + 
+                                   (cy - hist.cy) * (cy - hist.cy));
+            
+            if (dist < static_move_threshold_) {
+                // 位置相近，增加静止计数
+                hist.static_count++;
+                hist.last_seen_frame = current_frame_;
+                candidate.is_static = true;
+                candidate.static_frames = hist.static_count;
+                return;
+            }
+        }
+
+        // 没有找到匹配的历史，这是新位置
+        candidate.is_static = false;
+        candidate.static_frames = 0;
+    }
+
+    /**
+     * 更新历史记录
+     */
+    void update_history(const T_DetectObject& det) {
+        current_frame_++;
+        
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+
+        // 清理过期的历史记录
+        ball_history_.erase(
+            std::remove_if(ball_history_.begin(), ball_history_.end(),
+                [this](const BallHistory& h) {
+                    return (current_frame_ - h.last_seen_frame) > 60;  // 60帧未出现则移除
+                }),
+            ball_history_.end());
+
+        // 查找并更新或添加新记录
+        for (auto& hist : ball_history_) {
+            float dist = std::sqrt((cx - hist.cx) * (cx - hist.cx) + 
+                                   (cy - hist.cy) * (cy - hist.cy));
+            if (dist < static_move_threshold_) {
+                hist.cx = cx;
+                hist.cy = cy;
+                hist.last_seen_frame = current_frame_;
+                return;
+            }
+        }
+
+        // 添加新记录
+        if (ball_history_.size() < 20) {  // 最多记录20个位置
+            ball_history_.push_back({cx, cy, 0, current_frame_});
+        }
+    }
+
+    /**
+     * 计算与跟踪器的距离
+     */
+    float calculate_distance(const T_DetectObject& det, const T_TrackObject& tracker) {
+        float det_cx = (det.xmin + det.xmax) / 2.0f;
+        float det_cy = (det.ymin + det.ymax) / 2.0f;
+        float trk_cx = (tracker.xmin + tracker.xmax) / 2.0f;
+        float trk_cy = (tracker.ymin + tracker.ymax) / 2.0f;
+        
+        return std::sqrt((det_cx - trk_cx) * (det_cx - trk_cx) + 
+                         (det_cy - trk_cy) * (det_cy - trk_cy));
+    }
+
+    /**
+     * 计算综合优先级分数
+     */
+    float calculate_priority(const BallCandidate& candidate, bool has_tracker) {
+        float score = 0.0f;
+
+        // 置信度分数（0~100）
+        score += candidate.det.score * 100.0f;
+
+        // 跟踪器距离分数（有跟踪器时，距离越近分数越高）
+        if (has_tracker && candidate.distance_to_tracker < 1e8f) {
+            // 距离在 500 像素内给予额外加分
+            if (candidate.distance_to_tracker < 500.0f) {
+                score += (500.0f - candidate.distance_to_tracker) * 0.5f;  // 最多加 250 分
+            }
+        }
+
+        // 静止惩罚（静止越久分数越低）
+        score -= candidate.static_frames * 2.0f;
+
+        // 位置偏好（靠近画面中心的球优先）
+        float cx = (candidate.det.xmin + candidate.det.xmax) / 2.0f;
+        float cy = (candidate.det.ymin + candidate.det.ymax) / 2.0f;
+        float center_x = (valid_left_ + valid_right_) / 2.0f;
+        float center_y = (valid_top_ + valid_bottom_) / 2.0f;
+        float dist_to_center = std::sqrt((cx - center_x) * (cx - center_x) + 
+                                          (cy - center_y) * (cy - center_y));
+        score -= dist_to_center * 0.01f;  // 轻微惩罚远离中心的球
+
+        return score;
+    }
+};
+
+/*------------------------------------------------*/
+/**
+ * 图像分割检测器 - 将大图分割成多块分别检测
+ */
+/*------------------------------------------------*/
+/**
+ * 图像分割检测器 - 将大图分割成多块分别检测
+ */
+class SplitDetector {
+public:
+    struct SplitRegion {
+        int x_offset;      // 在原图中的 X 偏移
+        int y_offset;      // 在原图中的 Y 偏移
+        int width;         // 区域宽度
+        int height;        // 区域高度
+    };
+
+    // 分割配置
+    static constexpr int SPLIT_WIDTH = 2560;       // 每块宽度
+    static constexpr int OVERLAP = 256;            // 重叠区域
+
+    /**
+     * 检查是否需要分割检测
+     */
+    static bool needs_split(int img_width) {
+        return img_width > SPLIT_WIDTH;
+    }
+
+    /**
+     * 计算分割区域
+     */
+    static std::vector<SplitRegion> calculate_split_regions(int img_width, int img_height) {
+        std::vector<SplitRegion> regions;
+
+        if (img_width <= SPLIT_WIDTH) {
+            regions.push_back({0, 0, img_width, img_height});
+            return regions;
+        }
+
+        int step = SPLIT_WIDTH - OVERLAP;
+        int x = 0;
+        
+        while (x < img_width) {
+            int region_width = std::min(SPLIT_WIDTH, img_width - x);
+            
+            if (img_width - x < SPLIT_WIDTH && x > 0) {
+                x = img_width - SPLIT_WIDTH;
+                region_width = SPLIT_WIDTH;
+            }
+            
+            regions.push_back({x, 0, region_width, img_height});
+            
+            if (x + region_width >= img_width) break;
+            x += step;
+        }
+
+        return regions;
+    }
+
+    /**
+     * 裁剪图像区域
+     */
+    static int crop_region(const image_buffer_t* src, image_buffer_t* dst,
+                           const SplitRegion& region) {
+        if (!src || !src->virt_addr || !dst) {
+            return -1;
+        }
+
+        int src_w = src->width;
+        int src_h = src->height;
+        int channels = 3;
+
+        size_t dst_size = region.width * region.height * channels;
+        
+        memset(dst, 0, sizeof(image_buffer_t));
+        dst->width = region.width;
+        dst->height = region.height;
+        dst->size = dst_size;
+        dst->format = src->format;
+        dst->fd = -1;
+        dst->virt_addr = (unsigned char*)malloc(dst_size);
+        if (!dst->virt_addr) {
+            return -1;
+        }
+
+        for (int y = 0; y < region.height; y++) {
+            int src_y = region.y_offset + y;
+            if (src_y >= src_h) break;
+
+            unsigned char* src_row = src->virt_addr + (src_y * src_w + region.x_offset) * channels;
+            unsigned char* dst_row = dst->virt_addr + (y * region.width) * channels;
+            
+            int copy_width = std::min(region.width, src_w - region.x_offset);
+            memcpy(dst_row, src_row, copy_width * channels);
+        }
+
+        return 0;
+    }
+
+    /**
+     * 将检测结果坐标还原到原图（加上区域偏移）
+     */
+    static void restore_to_original(const SplitRegion& region,
+                                    int& xmin, int& ymin, int& xmax, int& ymax) {
+        xmin += region.x_offset;
+        xmax += region.x_offset;
+        ymin += region.y_offset;
+        ymax += region.y_offset;
+    }
+
+    /**
+     * 合并多个区域的检测结果（去重）
+     */
+    static void merge_detections(std::vector<T_DetectObject>& all_detections,
+                                  const std::vector<T_DetectObject>& new_detections,
+                                  float iou_threshold = 0.5f) {
+        for (const auto& new_det : new_detections) {
+            bool is_duplicate = false;
+            
+            for (auto& existing : all_detections) {
+                float iou = calculate_iou(existing, new_det);
+                if (iou > iou_threshold) {
+                    if (new_det.score > existing.score) {
+                        existing = new_det;
+                    }
+                    is_duplicate = true;
+                    break;
+                }
+            }
+            
+            if (!is_duplicate) {
+                all_detections.push_back(new_det);
+            }
+        }
+    }
+
+private:
+    static float calculate_iou(const T_DetectObject& a, const T_DetectObject& b) {
+        float inter_left = std::max(a.xmin, b.xmin);
+        float inter_top = std::max(a.ymin, b.ymin);
+        float inter_right = std::min(a.xmax, b.xmax);
+        float inter_bottom = std::min(a.ymax, b.ymax);
+
+        if (inter_right <= inter_left || inter_bottom <= inter_top) {
+            return 0.0f;
+        }
+
+        float inter_area = (inter_right - inter_left) * (inter_bottom - inter_top);
+        float area_a = (a.xmax - a.xmin) * (a.ymax - a.ymin);
+        float area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
+        float union_area = area_a + area_b - inter_area;
+
+        return inter_area / union_area;
+    }
+};
+
+//裁切输出版本
 void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_path, const char *out_dir)
 {
     rknn_app_context_t rknn_app_ctx;
@@ -664,6 +1071,9 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
 
     DetectionAreaManager detect_manager(15, 3);
 
+    // 球筛选器
+    BallSelector ball_selector(0, PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
+
     printf("[Consumer] Detection mode: CROP=%dx%d, FULLFRAME=%dx%d\n",
            ALG_CROP_WIDTH, ALG_CROP_HEIGHT, PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
 
@@ -676,40 +1086,112 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                 printf("[Consumer] Queue stopped, exiting\n");
                 break;
             }
+            
+            if (frame_count == 0) {
+                printf("[Consumer] Input resolution: %dx%d\n", src_image.width, src_image.height);
+                if (SplitDetector::needs_split(src_image.width)) {
+                    printf("[Consumer] Split detection enabled (width > %d)\n", SplitDetector::SPLIT_WIDTH);
+                }
+            }
         }
         
         memset(&crop_image_buf, 0, sizeof(image_buffer_t));
 
         bool is_fullframe_mode = detect_manager.is_fullframe_mode();
         bool found_ball = false;
-        object_detect_result_list od_results;
-
-        // ===== 公共变量：存储检测和跟踪结果（原图坐标）=====
-        std::vector<T_DetectObject> ball_detections;  // 球的检测结果（原图坐标）
-        std::vector<T_TrackObject> track_results;     // 跟踪结果（原图坐标）
+        
+        std::vector<T_DetectObject> all_ball_detections;
+        std::vector<T_DetectObject> ball_detections;
+        std::vector<T_TrackObject> track_results;
 
         if (is_fullframe_mode) {
             // ===== 全图检测模式 =====
             camera.update_and_draw_only(&src_image);
-            inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
             
-            // 提取球的检测结果（已经是原图坐标）
-            for (int j = 0; j < od_results.count; j++) {
-                object_detect_result *det = &(od_results.results[j]);
-                char text[64];
-                snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+            if (SplitDetector::needs_split(src_image.width)) {
+                // ===== 分割检测模式（大图）=====
+                auto regions = SplitDetector::calculate_split_regions(
+                    src_image.width, src_image.height);
                 
-                if (strncmp(text, "ball", 4) == 0) {
-                    found_ball = true;
+                printf("[Consumer][FULLFRAME] Split into %zu regions\n", regions.size());
+
+                for (size_t i = 0; i < regions.size(); i++) {
+                    const auto& region = regions[i];
                     
-                    T_DetectObject obj;
-                    obj.cls_id = det->cls_id;
-                    obj.score = det->prop;
-                    obj.xmin = det->box.left;
-                    obj.ymin = det->box.top;
-                    obj.xmax = det->box.right;
-                    obj.ymax = det->box.bottom;
-                    ball_detections.push_back(obj);
+                    // 裁剪区域
+                    image_buffer_t region_img = {0};
+                    ret = SplitDetector::crop_region(&src_image, &region_img, region);
+                    if (ret != 0) {
+                        printf("[Consumer] Crop region %zu failed\n", i);
+                        continue;
+                    }
+
+                    // 直接对裁剪区域推理（2560x1440 或更小）
+                    object_detect_result_list od_results;
+                    inference_yolov8_model(&rknn_app_ctx, &region_img, &od_results);
+
+                    // 处理检测结果
+                    std::vector<T_DetectObject> region_detections;
+                    for (int j = 0; j < od_results.count; j++) {
+                        object_detect_result *det = &(od_results.results[j]);
+                        char text[64];
+                        snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+                        
+                        if (strncmp(text, "ball", 4) == 0) {
+                            int xmin = det->box.left;
+                            int ymin = det->box.top;
+                            int xmax = det->box.right;
+                            int ymax = det->box.bottom;
+                            
+                            // 还原到原图坐标（加上区域偏移）
+                            SplitDetector::restore_to_original(region, xmin, ymin, xmax, ymax);
+                            
+                            T_DetectObject obj;
+                            obj.cls_id = det->cls_id;
+                            obj.score = det->prop;
+                            obj.xmin = xmin;
+                            obj.ymin = ymin;
+                            obj.xmax = xmax;
+                            obj.ymax = ymax;
+                            region_detections.push_back(obj);
+                            
+                            printf("[Consumer][FULLFRAME][Region%zu] Found ball @ orig(%d,%d,%d,%d) %.3f\n",
+                                   i, xmin, ymin, xmax, ymax, det->prop);
+                        }
+                    }
+
+                    // 合并检测结果（去重）
+                    SplitDetector::merge_detections(all_ball_detections, region_detections);
+
+                    // 释放区域图像
+                    if (region_img.virt_addr) {
+                        free(region_img.virt_addr);
+                        region_img.virt_addr = NULL;
+                    }
+                }
+            } else {
+                // ===== 普通全图检测（不需要分割）=====
+                object_detect_result_list od_results;
+                inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+                
+                for (int j = 0; j < od_results.count; j++) {
+                    object_detect_result *det = &(od_results.results[j]);
+                    char text[64];
+                    snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+                    
+                    if (strncmp(text, "ball", 4) == 0) {
+                        T_DetectObject obj;
+                        obj.cls_id = det->cls_id;
+                        obj.score = det->prop;
+                        obj.xmin = det->box.left;
+                        obj.ymin = det->box.top;
+                        obj.xmax = det->box.right;
+                        obj.ymax = det->box.bottom;
+                        all_ball_detections.push_back(obj);
+                        
+                        printf("[Consumer][FULLFRAME] Found ball @ (%d,%d,%d,%d) %.3f\n",
+                               det->box.left, det->box.top, det->box.right, det->box.bottom, det->prop);
+                    }
                 }
             }
             
@@ -727,17 +1209,15 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                 continue;
             }
 
+            object_detect_result_list od_results;
             inference_yolov8_model(&rknn_app_ctx, &crop_image_buf, &od_results);
 
-            // 提取球的检测结果，并转换为原图坐标
             for (int j = 0; j < od_results.count; j++) {
                 object_detect_result *det = &(od_results.results[j]);
                 char text[64];
                 snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
                 
                 if (strncmp(text, "ball", 4) == 0) {
-                    found_ball = true;
-                    
                     T_DetectObject obj;
                     obj.cls_id = det->cls_id;
                     obj.score = det->prop;
@@ -746,71 +1226,103 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                     obj.ymin = camera.get_rect().top + det->box.top;
                     obj.xmax = camera.get_rect().left + det->box.right;
                     obj.ymax = camera.get_rect().top + det->box.bottom;
-                    ball_detections.push_back(obj);
+                    all_ball_detections.push_back(obj);
                 }
             }
         }
 
-        // ===== 统一的跟踪处理（始终使用原图坐标）=====
+        // ===== 球筛选：从多个检测中选择目标球 =====
+        if (!all_ball_detections.empty()) {
+            T_TrackObject tracker_pred;
+            bool has_tracker = tracker.HasActiveTrack();
+            
+            const T_DetectObject* target = ball_selector.select_target_ball(
+                all_ball_detections,
+                has_tracker ? &tracker_pred : nullptr,
+                has_tracker
+            );
+            
+            if (target != nullptr) {
+                ball_detections.push_back(*target);
+                found_ball = true;
+                
+                printf("[Consumer] Selected target ball @ (%d,%d,%d,%d) from %zu candidates\n",
+                       (int)target->xmin, (int)target->ymin,
+                       (int)target->xmax, (int)target->ymax,
+                       all_ball_detections.size());
+            }
+        }
+
+        // ===== 统一的跟踪处理 =====
         if (!ball_detections.empty() || tracker.HasActiveTrack()) {
             tracker.ProcessFrame(frame_track_count, ball_detections, track_results);
         }
 
-        // ===== 统一的绘图处理（在裁剪图上绘制）=====
+        // ===== 统一的绘图处理 =====
         if (crop_image_buf.virt_addr != NULL) {
-            // 绘制检测框（蓝色）
-            for (const auto& det : ball_detections) {
-                // 原图坐标 → 裁剪图坐标
+            // 绘制所有检测到的球（白色细框，调试用）
+            for (const auto& det : all_ball_detections) {
                 int crop_x1 = det.xmin - camera.get_rect().left;
                 int crop_y1 = det.ymin - camera.get_rect().top;
                 int crop_x2 = det.xmax - camera.get_rect().left;
                 int crop_y2 = det.ymax - camera.get_rect().top;
                 
-                // 检查是否在裁剪框内
                 if (crop_x1 >= 0 && crop_y1 >= 0 && 
                     crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
-                    
+                    draw_rectangle(&crop_image_buf, 
+                                   crop_x1, crop_y1,
+                                   crop_x2 - crop_x1, crop_y2 - crop_y1,
+                                   COLOR_WHITE, 1);
+                }
+            }
+
+            // 绘制选中的目标球（蓝色粗框）
+            for (const auto& det : ball_detections) {
+                int crop_x1 = det.xmin - camera.get_rect().left;
+                int crop_y1 = det.ymin - camera.get_rect().top;
+                int crop_x2 = det.xmax - camera.get_rect().left;
+                int crop_y2 = det.ymax - camera.get_rect().top;
+                
+                if (crop_x1 >= 0 && crop_y1 >= 0 && 
+                    crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
                     draw_rectangle(&crop_image_buf, 
                                    crop_x1, crop_y1,
                                    crop_x2 - crop_x1, crop_y2 - crop_y1,
                                    COLOR_BLUE, 3);
                     
                     char text[64];
-                    snprintf(text, sizeof(text), "ball %.1f%%", det.score * 100);
+                    snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
                     draw_text(&crop_image_buf, text, crop_x1, crop_y1 - 20, COLOR_RED, 10);
                 }
             }
             
             // 绘制跟踪框（绿色）
             for (const auto& trk : track_results) {
-                // 原图坐标 → 裁剪图坐标
                 int crop_x1 = trk.xmin - camera.get_rect().left;
                 int crop_y1 = trk.ymin - camera.get_rect().top;
                 int crop_x2 = trk.xmax - camera.get_rect().left;
                 int crop_y2 = trk.ymax - camera.get_rect().top;
                 
-                // 检查是否在裁剪框内
                 if (crop_x1 >= 0 && crop_y1 >= 0 && 
                     crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
-                    
                     draw_rectangle(&crop_image_buf, 
                                    crop_x1, crop_y1,
                                    crop_x2 - crop_x1, crop_y2 - crop_y1,
                                    COLOR_GREEN, 3);
                     
-                    // 标记是否为预测框
                     if (trk.is_predicted) {
                         draw_text(&crop_image_buf, "[PRED]", crop_x1, crop_y1 - 40, COLOR_YELLOW, 10);
                     }
                 }
             }
             
-            // 绘制调试信息
+            // 调试信息
             char debug_text[128];
-            snprintf(debug_text, sizeof(debug_text), "Mode:%s Dist:%.1f Miss:%d",
+            snprintf(debug_text, sizeof(debug_text), "Mode:%s Balls:%zu->%zu Dist:%.1f",
                      is_fullframe_mode ? "FULL" : "CROP",
-                     tracker.GetLastGatingDistance(),
-                     tracker.GetMissCount());
+                     all_ball_detections.size(),
+                     ball_detections.size(),
+                     tracker.GetLastGatingDistance());
             draw_text(&crop_image_buf, debug_text, 10, 20, COLOR_YELLOW, 12);
         }
 
@@ -818,10 +1330,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         if (!track_results.empty()) {
             auto &t = track_results[0];
             camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
-            
-            printf("[Consumer] Track @ full(%.0f %.0f %.0f %.0f) %s\n",
-                   t.xmin, t.ymin, t.xmax, t.ymax,
-                   t.is_predicted ? "[PREDICTED]" : "[MATCHED]");
         }
 
         // ===== 更新检测模式 =====
@@ -861,6 +1369,310 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     release_yolov8_model(&rknn_app_ctx);
 }
 
+//调试版本
+// void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_path, const char *out_dir)
+// {
+//     rknn_app_context_t rknn_app_ctx;
+//     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
+
+//     init_post_process();
+//     int ret = init_yolov8_model(model_path, &rknn_app_ctx);
+//     if (ret) {
+//         printf("[Consumer] init_yolov8_model failed!\n");
+//         return;
+//     }
+
+//     char cmd[256];
+//     snprintf(cmd, sizeof(cmd), "mkdir -p %s", out_dir);
+//     system(cmd);
+
+//     int frame_count = 0;
+//     int frame_track_count = 0;
+//     image_buffer_t src_image = {0};
+//     image_buffer_t crop_image_buf = {0};
+    
+//     TrackFrame tracker;
+//     tracker.Init(50);
+    
+//     SmoothCameraController camera(
+//         PIC_FULL_WIDTH, 
+//         PIC_FULL_HEIGHT, 
+//         ALG_CROP_WIDTH, 
+//         ALG_CROP_HEIGHT,
+//         VALID_TOP,
+//         VALID_BOTTOM
+//     );
+
+//     DetectionAreaManager detect_manager(15, 3);
+
+//     // 球筛选器
+//     BallSelector ball_selector(0, PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
+
+//     printf("[Consumer][DEBUG] Output: FULL IMAGE with crop window\n");
+//     printf("[Consumer] Detection mode: CROP=%dx%d, FULLFRAME=%dx%d\n",
+//            ALG_CROP_WIDTH, ALG_CROP_HEIGHT, PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
+
+//     while (true) {
+//         frame_track_count++;
+        
+//         if (src_image.width == 0 && src_image.height == 0) {
+//             memset(&src_image, 0, sizeof(image_buffer_t));
+//             if (!fq.pop(src_image)) {
+//                 printf("[Consumer] Queue stopped, exiting\n");
+//                 break;
+//             }
+            
+//             if (frame_count == 0) {
+//                 printf("[Consumer] Input resolution: %dx%d\n", src_image.width, src_image.height);
+//                 if (SplitDetector::needs_split(src_image.width)) {
+//                     printf("[Consumer] Split detection enabled (width > %d)\n", SplitDetector::SPLIT_WIDTH);
+//                 }
+//             }
+//         }
+        
+//         memset(&crop_image_buf, 0, sizeof(image_buffer_t));
+
+//         bool is_fullframe_mode = detect_manager.is_fullframe_mode();
+//         bool found_ball = false;
+        
+//         std::vector<T_DetectObject> all_ball_detections;
+//         std::vector<T_DetectObject> ball_detections;
+//         std::vector<T_TrackObject> track_results;
+
+//         if (is_fullframe_mode) {
+//             // ===== 全图检测模式 =====
+//             camera.update_and_draw_only(&src_image);
+            
+//             if (SplitDetector::needs_split(src_image.width)) {
+//                 // ===== 分割检测模式（大图）=====
+//                 auto regions = SplitDetector::calculate_split_regions(
+//                     src_image.width, src_image.height);
+
+//                 for (size_t i = 0; i < regions.size(); i++) {
+//                     const auto& region = regions[i];
+                    
+//                     image_buffer_t region_img = {0};
+//                     ret = SplitDetector::crop_region(&src_image, &region_img, region);
+//                     if (ret != 0) {
+//                         continue;
+//                     }
+
+//                     object_detect_result_list od_results;
+//                     inference_yolov8_model(&rknn_app_ctx, &region_img, &od_results);
+
+//                     std::vector<T_DetectObject> region_detections;
+//                     for (int j = 0; j < od_results.count; j++) {
+//                         object_detect_result *det = &(od_results.results[j]);
+//                         char text[64];
+//                         snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+                        
+//                         if (strncmp(text, "ball", 4) == 0) {
+//                             int xmin = det->box.left;
+//                             int ymin = det->box.top;
+//                             int xmax = det->box.right;
+//                             int ymax = det->box.bottom;
+                            
+//                             SplitDetector::restore_to_original(region, xmin, ymin, xmax, ymax);
+                            
+//                             T_DetectObject obj;
+//                             obj.cls_id = det->cls_id;
+//                             obj.score = det->prop;
+//                             obj.xmin = xmin;
+//                             obj.ymin = ymin;
+//                             obj.xmax = xmax;
+//                             obj.ymax = ymax;
+//                             region_detections.push_back(obj);
+//                         }
+//                     }
+
+//                     SplitDetector::merge_detections(all_ball_detections, region_detections);
+
+//                     if (region_img.virt_addr) {
+//                         free(region_img.virt_addr);
+//                         region_img.virt_addr = NULL;
+//                     }
+//                 }
+//             } else {
+//                 // ===== 普通全图检测 =====
+//                 object_detect_result_list od_results;
+//                 inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+                
+//                 for (int j = 0; j < od_results.count; j++) {
+//                     object_detect_result *det = &(od_results.results[j]);
+//                     char text[64];
+//                     snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+                    
+//                     if (strncmp(text, "ball", 4) == 0) {
+//                         T_DetectObject obj;
+//                         obj.cls_id = det->cls_id;
+//                         obj.score = det->prop;
+//                         obj.xmin = det->box.left;
+//                         obj.ymin = det->box.top;
+//                         obj.xmax = det->box.right;
+//                         obj.ymax = det->box.bottom;
+//                         all_ball_detections.push_back(obj);
+//                     }
+//                 }
+//             }
+            
+//             // 仍然需要裁剪图用于检测（但不输出）
+//             camera.crop_current_window(&src_image, &crop_image_buf);
+
+//         } else {
+//             // ===== 裁剪区域检测模式 =====
+//             camera.get_crop_window(&src_image, &crop_image_buf);
+
+//             if (crop_image_buf.virt_addr == NULL) {
+//                 printf("[Consumer] crop_image is NULL\n");
+//                 pool.release(src_image);
+//                 memset(&src_image, 0, sizeof(image_buffer_t));
+//                 continue;
+//             }
+
+//             object_detect_result_list od_results;
+//             inference_yolov8_model(&rknn_app_ctx, &crop_image_buf, &od_results);
+
+//             for (int j = 0; j < od_results.count; j++) {
+//                 object_detect_result *det = &(od_results.results[j]);
+//                 char text[64];
+//                 snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+                
+//                 if (strncmp(text, "ball", 4) == 0) {
+//                     T_DetectObject obj;
+//                     obj.cls_id = det->cls_id;
+//                     obj.score = det->prop;
+//                     obj.xmin = camera.get_rect().left + det->box.left;
+//                     obj.ymin = camera.get_rect().top + det->box.top;
+//                     obj.xmax = camera.get_rect().left + det->box.right;
+//                     obj.ymax = camera.get_rect().top + det->box.bottom;
+//                     all_ball_detections.push_back(obj);
+//                 }
+//             }
+//         }
+
+//         // ===== 球筛选 =====
+//         if (!all_ball_detections.empty()) {
+//             T_TrackObject tracker_pred;
+//             bool has_tracker = tracker.HasActiveTrack();
+            
+//             const T_DetectObject* target = ball_selector.select_target_ball(
+//                 all_ball_detections,
+//                 has_tracker ? &tracker_pred : nullptr,
+//                 has_tracker
+//             );
+            
+//             if (target != nullptr) {
+//                 ball_detections.push_back(*target);
+//                 found_ball = true;
+//             }
+//         }
+
+//         // ===== 跟踪处理 =====
+//         if (!ball_detections.empty() || tracker.HasActiveTrack()) {
+//             tracker.ProcessFrame(frame_track_count, ball_detections, track_results);
+//         }
+
+//         // ===== 在原图上绘制（调试模式）=====
+//         {
+//             // 1. 绘制裁剪窗口（红色粗框）
+//             image_rect_t crop_rect = camera.get_rect();
+//             draw_rectangle(&src_image, 
+//                            crop_rect.left, crop_rect.top,
+//                            crop_rect.right - crop_rect.left, 
+//                            crop_rect.bottom - crop_rect.top,
+//                            COLOR_RED, 4);
+
+//             // 2. 绘制所有检测到的球（白色细框）
+//             for (const auto& det : all_ball_detections) {
+//                 draw_rectangle(&src_image, 
+//                                det.xmin, det.ymin,
+//                                det.xmax - det.xmin, det.ymax - det.ymin,
+//                                COLOR_WHITE, 1);
+//             }
+
+//             // 3. 绘制选中的目标球（蓝色粗框）
+//             for (const auto& det : ball_detections) {
+//                 draw_rectangle(&src_image, 
+//                                det.xmin, det.ymin,
+//                                det.xmax - det.xmin, det.ymax - det.ymin,
+//                                COLOR_BLUE, 3);
+                
+//                 char text[64];
+//                 snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
+//                 draw_text(&src_image, text, det.xmin, det.ymin - 20, COLOR_RED, 10);
+//             }
+            
+//             // 4. 绘制跟踪框（绿色）
+//             for (const auto& trk : track_results) {
+//                 draw_rectangle(&src_image, 
+//                                trk.xmin, trk.ymin,
+//                                trk.xmax - trk.xmin, trk.ymax - trk.ymin,
+//                                COLOR_GREEN, 3);
+                
+//                 if (trk.is_predicted) {
+//                     draw_text(&src_image, "[PRED]", trk.xmin, trk.ymin - 40, COLOR_YELLOW, 10);
+//                 }
+//             }
+            
+//             // 5. 调试信息（左上角）
+//             char debug_text[128];
+//             snprintf(debug_text, sizeof(debug_text), "Mode:%s Balls:%zu->%zu Dist:%.1f",
+//                      is_fullframe_mode ? "FULL" : "CROP",
+//                      all_ball_detections.size(),
+//                      ball_detections.size(),
+//                      tracker.GetLastGatingDistance());
+//             draw_text(&src_image, debug_text, 10, 30, COLOR_YELLOW, 15);
+            
+//             // 6. 裁剪窗口位置信息
+//             char crop_info[64];
+//             snprintf(crop_info, sizeof(crop_info), "Crop:[%d,%d]-[%d,%d]",
+//                      crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom);
+//             draw_text(&src_image, crop_info, 10, 60, COLOR_RED, 12);
+//         }
+
+//         // ===== 更新运镜 =====
+//         if (!track_results.empty()) {
+//             auto &t = track_results[0];
+//             camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
+//         }
+
+//         // ===== 更新检测模式 =====
+//         detect_manager.report_detection(found_ball);
+        
+//         if (!found_ball) {
+//             camera.mark_no_target();
+//         }
+
+//         // ===== 保存原图（调试模式）=====
+//         {
+//             char out_path[256];
+//             snprintf(out_path, sizeof(out_path), "%s/%06d.jpg", out_dir, frame_count);
+//             write_image(out_path, &src_image);  // 输出原图
+//         }
+        
+//         frame_count++;
+        
+//         if (frame_count % 100 == 0) {
+//             printf("[Consumer] Processed %d frames, mode: %s\n", 
+//                    frame_count,
+//                    detect_manager.is_fullframe_mode() ? "FULLFRAME" : "CROP");
+//         }
+        
+//         // 释放裁剪图内存（仍然需要释放）
+//         if (crop_image_buf.virt_addr) {
+//             free(crop_image_buf.virt_addr);
+//             crop_image_buf.virt_addr = NULL;
+//         }
+        
+//         pool.release(src_image);
+//         memset(&src_image, 0, sizeof(image_buffer_t));
+//     }
+
+//     printf("[Consumer] Finished processing %d frames\n", frame_count);
+
+//     deinit_post_process();
+//     release_yolov8_model(&rknn_app_ctx);
+// }
 /*-----------------------------------------------*/
 int main(int argc, char* argv[])
 {
