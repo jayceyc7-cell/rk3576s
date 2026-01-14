@@ -25,14 +25,14 @@
 #include "awi_track.hpp"
 
 /*--------------------------------------*/
-// #define PIC_FULL_WIDTH 4608
-// #define PIC_FULL_HEIGHT 1440
-#define PIC_FULL_WIDTH 2560
+#define PIC_FULL_WIDTH 4608
 #define PIC_FULL_HEIGHT 1440
-#define ALG_CROP_WIDTH 1280
-#define ALG_CROP_HEIGHT 736
-#define VALID_TOP 205  //最小155
-#define VALID_BOTTOM 1085  // 1440 - 155 = 1285
+// #define PIC_FULL_WIDTH 2560
+// #define PIC_FULL_HEIGHT 1440
+#define ALG_CROP_WIDTH 1920
+#define ALG_CROP_HEIGHT 860
+#define VALID_TOP 476  //最小155
+#define VALID_BOTTOM (ALG_CROP_HEIGHT + VALID_TOP)  // 1440 - 155 = 1285
 
 // ===== 全局退出标志 =====
 static std::atomic<bool> g_exit{false};
@@ -144,80 +144,7 @@ private:
 
 /*------------------------------------------------*/
 /**
- * 检测区域管理器 - 管理裁剪检测和全图检测的切换
- */
-class DetectionAreaManager {
-public:
-    enum class Mode {
-        CROP_DETECT,    // 裁剪区域检测（正常模式）
-        FULLFRAME_DETECT // 全图检测（搜索模式）
-    };
-
-    DetectionAreaManager(int lost_threshold = 15, int found_threshold = 3)
-        : lost_threshold_(lost_threshold),    // 连续丢失多少帧后切换到全图
-          found_threshold_(found_threshold),  // 全图模式下连续找到多少帧后切回裁剪
-          consecutive_lost_(0),
-          consecutive_found_(0),
-          current_mode_(Mode::CROP_DETECT)
-    {
-    }
-
-    // 报告本帧是否检测到目标
-    void report_detection(bool found)
-    {
-        if (found) {
-            consecutive_lost_ = 0;
-            consecutive_found_++;
-            
-            // 全图模式下，连续找到目标，切回裁剪模式
-            if (current_mode_ == Mode::FULLFRAME_DETECT && 
-                consecutive_found_ >= found_threshold_) {
-                current_mode_ = Mode::CROP_DETECT;
-                consecutive_found_ = 0;
-                printf("[DetectionArea] Switch to CROP_DETECT mode\n");
-            }
-        } else {
-            consecutive_found_ = 0;
-            consecutive_lost_++;
-            
-            // 裁剪模式下，连续丢失目标，切到全图模式
-            if (current_mode_ == Mode::CROP_DETECT && 
-                consecutive_lost_ >= lost_threshold_) {
-                current_mode_ = Mode::FULLFRAME_DETECT;
-                consecutive_lost_ = 0;
-                printf("[DetectionArea] Switch to FULLFRAME_DETECT mode (lost %d frames)\n", 
-                       lost_threshold_);
-            }
-        }
-    }
-
-    Mode get_mode() const { return current_mode_; }
-    
-    bool is_fullframe_mode() const { 
-        return current_mode_ == Mode::FULLFRAME_DETECT; 
-    }
-    
-    int get_consecutive_lost() const { return consecutive_lost_; }
-
-    // 强制切换模式（调试用）
-    void force_mode(Mode mode)
-    {
-        current_mode_ = mode;
-        consecutive_lost_ = 0;
-        consecutive_found_ = 0;
-    }
-
-private:
-    int lost_threshold_;       // 丢失阈值
-    int found_threshold_;      // 找回阈值
-    int consecutive_lost_;     // 连续丢失帧数
-    int consecutive_found_;    // 连续找到帧数
-    Mode current_mode_;
-};
-
-/*------------------------------------------------*/
-/**
- * 丝滑运镜控制器 - 支持全图检测模式
+ * 丝滑运镜控制器 - 篮球快速跟踪优化版
  */
 class SmoothCameraController {
 public:
@@ -250,6 +177,13 @@ public:
         
         printf("[Camera] Valid region: y=[%d, %d], height=%d\n", 
                valid_top_, valid_bottom_, valid_height_);
+        printf("[Camera] Tracking params: stiffness=%.3f, damping=%.2f, max_speed=%.1f, max_accel=%.1f\n",
+               stiffness_, damping_, max_speed_, max_accel_);
+    }
+
+    void update_position_only()
+    {
+        update_camera_position();
     }
 
     const image_rect_t& get_rect() const
@@ -257,7 +191,6 @@ public:
         return rect_;
     }
 
-    // 每帧调用：更新相机位置 + 裁剪
     void get_crop_window(image_buffer_t* src, image_buffer_t* dst)
     {
         update_camera_position();
@@ -265,35 +198,46 @@ public:
         crop_image(src, dst);
     }
 
-    // 仅更新相机位置和绘制，不做裁剪（全图检测模式下使用）
     void update_and_draw_only(image_buffer_t* src)
     {
         update_camera_position();
         draw_crop_rect(src);
     }
 
-    // 根据当前裁剪框对全图进行裁剪输出
     void crop_current_window(image_buffer_t* src, image_buffer_t* dst)
     {
         crop_image(src, dst);
     }
 
-    // 收到跟踪目标时调用（原图坐标）
     void update_by_target(int xmin, int ymin, int xmax, int ymax)
     {
         float new_target_cx = 0.5f * (xmin + xmax);
         float new_target_cy = 0.5f * (ymin + ymax);
         
-        target_vx_ = velocity_smooth_ * (new_target_cx - last_target_cx_) 
-                   + (1.0f - velocity_smooth_) * target_vx_;
-        target_vy_ = velocity_smooth_ * (new_target_cy - last_target_cy_) 
-                   + (1.0f - velocity_smooth_) * target_vy_;
+        // 计算目标速度（平滑处理）
+        float instant_vx = new_target_cx - last_target_cx_;
+        float instant_vy = new_target_cy - last_target_cy_;
+        
+        target_vx_ = velocity_smooth_ * instant_vx + (1.0f - velocity_smooth_) * target_vx_;
+        target_vy_ = velocity_smooth_ * instant_vy + (1.0f - velocity_smooth_) * target_vy_;
+        
+        // 检测快速运动，动态调整预测帧数
+        float target_speed = std::sqrt(target_vx_ * target_vx_ + target_vy_ * target_vy_);
+        float dynamic_prediction = prediction_frames_;
+        
+        // 目标移动越快，预测越多
+        if (target_speed > 30.0f) {
+            dynamic_prediction = prediction_frames_ + 2.0f;  // 快速运动时增加预测
+        } else if (target_speed > 60.0f) {
+            dynamic_prediction = prediction_frames_ + 4.0f;  // 非常快时更多预测
+        }
         
         last_target_cx_ = target_cx_;
         last_target_cy_ = target_cy_;
         
-        target_cx_ = new_target_cx + target_vx_ * prediction_frames_;
-        target_cy_ = new_target_cy + target_vy_ * prediction_frames_;
+        // 使用动态预测
+        target_cx_ = new_target_cx + target_vx_ * dynamic_prediction;
+        target_cy_ = new_target_cy + target_vy_ * dynamic_prediction;
         
         limit_target();
         
@@ -301,27 +245,22 @@ public:
         has_target_ = true;
     }
 
-    // 全图检测结果转换为原图坐标后更新（全图模式下使用）
-    // 参数已经是原图坐标，直接调用 update_by_target
     void update_by_fullframe_target(int xmin, int ymin, int xmax, int ymax)
     {
         update_by_target(xmin, ymin, xmax, ymax);
     }
 
-    // 裁剪图坐标转原图坐标
     void crop_to_fullframe(int crop_x, int crop_y, int& full_x, int& full_y) const
     {
         full_x = rect_.left + crop_x;
         full_y = rect_.top + crop_y;
     }
 
-    // 原图坐标转裁剪图坐标
     bool fullframe_to_crop(int full_x, int full_y, int& crop_x, int& crop_y) const
     {
         crop_x = full_x - rect_.left;
         crop_y = full_y - rect_.top;
         
-        // 检查是否在裁剪框内
         return (crop_x >= 0 && crop_x < crop_w_ && 
                 crop_y >= 0 && crop_y < crop_h_);
     }
@@ -339,11 +278,38 @@ public:
         }
     }
 
-    // 获取图像尺寸信息
+    void set_center(float cx, float cy)
+    {
+        cx = std::max(crop_w_ * 0.5f, std::min(cx, img_w_ - crop_w_ * 0.5f));
+        
+        float min_cy = valid_top_ + crop_h_ * 0.5f;
+        float max_cy = valid_bottom_ - crop_h_ * 0.5f;
+        cy = std::max(min_cy, std::min(cy, max_cy));
+        
+        cx_ = cx;
+        cy_ = cy;
+        
+        vx_ = 0.0f;
+        vy_ = 0.0f;
+        
+        target_cx_ = cx;
+        target_cy_ = cy;
+        target_vx_ = 0.0f;
+        target_vy_ = 0.0f;
+        last_target_cx_ = cx;
+        last_target_cy_ = cy;
+        
+        update_rect();
+        
+        printf("[Camera] Center set to (%.1f, %.1f)\n", cx_, cy_);
+    }
+
     int get_img_width() const { return img_w_; }
     int get_img_height() const { return img_h_; }
     int get_crop_width() const { return crop_w_; }
     int get_crop_height() const { return crop_h_; }
+    float get_center_x() const { return cx_; }
+    float get_center_y() const { return cy_; }
 
 private:
     int img_w_, img_h_;
@@ -364,13 +330,29 @@ private:
     bool has_target_{false};
     int frames_without_target_{0};
 
-    const float stiffness_ = 0.02f;
-    const float damping_ = 0.5f;
-    const float max_speed_ = 20.0f;
-    const float max_accel_ = 1.5f;
-    const float dead_zone_ratio_ = 0.20f;
-    const float prediction_frames_ = 2.0f;
+    // ================= 优化后的运镜参数 =================
+    // 弹簧刚度：增大以提高响应速度（原 0.02 → 0.05）
+    const float stiffness_ = 0.03f;
+    
+    // 阻尼系数：略微降低以提高灵活性（原 0.5 → 0.4）
+    const float damping_ = 0.4f;
+    
+    // 最大速度：大幅增加以跟上快速传球（原 20 → 50）
+    const float max_speed_ = 30.0f;
+    
+    // 最大加速度：增加以快速响应（原 1.5 → 4.0）
+    const float max_accel_ = 2.5f;
+    
+    // 死区比例：减小以提高灵敏度（原 0.20 → 0.12）
+    const float dead_zone_ratio_ = 0.15f;
+    
+    // 预测帧数：增加以提前预判（原 2.0 → 4.0）
+    const float prediction_frames_ = 2.5f;
+    
+    // 速度平滑系数：增加以更快响应速度变化（原 0.25 → 0.35）
     const float velocity_smooth_ = 0.25f;
+    
+    // 回中延迟和速度（保持不变）
     const int return_to_center_delay_ = 60;
     const float return_to_center_speed_ = 0.01f;
 
@@ -383,19 +365,38 @@ private:
         float dead_zone_x = crop_w_ * dead_zone_ratio_;
         float dead_zone_y = crop_h_ * dead_zone_ratio_;
         
+        // 计算距离，用于动态调整响应
+        float distance = std::sqrt(dx * dx + dy * dy);
+        
         if (std::fabs(dx) < dead_zone_x && std::fabs(dy) < dead_zone_y) {
+            // 在死区内，缓慢减速
             vx_ *= (1.0f - damping_ * 0.5f);
             vy_ *= (1.0f - damping_ * 0.5f);
         } else {
-            float fx = stiffness_ * dx;
-            float fy = stiffness_ * dy;
+            // 动态刚度：距离越远，响应越强
+            float dynamic_stiffness = stiffness_;
+            if (distance > 200.0f) {
+                dynamic_stiffness = stiffness_ * 1.5f;  // 距离远时增强响应
+            }
+            if (distance > 400.0f) {
+                dynamic_stiffness = stiffness_ * 2.0f;  // 距离很远时更强响应
+            }
+            
+            float fx = dynamic_stiffness * dx;
+            float fy = dynamic_stiffness * dy;
             
             fx -= damping_ * vx_;
             fy -= damping_ * vy_;
             
+            // 动态最大加速度：距离远时允许更大加速度
+            float dynamic_max_accel = max_accel_;
+            if (distance > 300.0f) {
+                dynamic_max_accel = max_accel_ * 1.5f;
+            }
+            
             float accel = std::sqrt(fx * fx + fy * fy);
-            if (accel > max_accel_) {
-                float scale = max_accel_ / accel;
+            if (accel > dynamic_max_accel) {
+                float scale = dynamic_max_accel / accel;
                 fx *= scale;
                 fy *= scale;
             }
@@ -404,9 +405,22 @@ private:
             vy_ += fy;
         }
         
+        // 动态最大速度：目标远时允许更快移动
+        float distance_to_target = std::sqrt(
+            (target_cx_ - cx_) * (target_cx_ - cx_) + 
+            (target_cy_ - cy_) * (target_cy_ - cy_));
+        
+        float dynamic_max_speed = max_speed_;
+        if (distance_to_target > 200.0f) {
+            dynamic_max_speed = max_speed_ * 1.3f;
+        }
+        if (distance_to_target > 400.0f) {
+            dynamic_max_speed = max_speed_ * 1.6f;
+        }
+        
         float speed = std::sqrt(vx_ * vx_ + vy_ * vy_);
-        if (speed > max_speed_) {
-            float scale = max_speed_ / speed;
+        if (speed > dynamic_max_speed) {
+            float scale = dynamic_max_speed / speed;
             vx_ *= scale;
             vy_ *= scale;
         }
@@ -501,7 +515,6 @@ private:
         }
     }
 };
-
 /*---------------------------------------------------*/
 // 阻塞式帧队列
 class FrameQueue {
@@ -631,139 +644,295 @@ void producer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *frames_d
 
 /*------------------------------------------------*/
 /**
- * 球目标筛选器 - 排除干扰球，锁定目标球
+ * 球目标筛选器 - 增强版（支持区域限制）
  */
 class BallSelector {
 public:
     struct BallCandidate {
         T_DetectObject det;
-        float distance_to_tracker;  // 与当前跟踪的距离
-        bool is_static;             // 是否为静止球
-        int static_frames;          // 静止帧数
-        float priority_score;       // 综合优先级分数
+        float distance_to_tracker;
+        float distance_to_crop_center;
+        float distance_to_last_target;
+        bool is_static;
+        int static_frames;
+        bool ever_moved;
+        bool is_in_crop_region;      // 新增：是否在裁剪框内
+        float priority_score;
     };
 
     BallSelector(int valid_left, int valid_right, int valid_top, int valid_bottom)
         : valid_left_(valid_left),
           valid_right_(valid_right),
           valid_top_(valid_top),
-          valid_bottom_(valid_bottom)
+          valid_bottom_(valid_bottom),
+          current_frame_(0),
+          has_locked_target_(false),
+          frames_since_target_lost_(0),
+          last_target_cx_(0),
+          last_target_cy_(0),
+          last_target_vx_(0),
+          last_target_vy_(0),
+          crop_center_x_(0),
+          crop_center_y_(0),
+          crop_half_w_(640),
+          crop_half_h_(368),
+          use_crop_center_bias_(false),
+          target_was_moving_(false),
+          consecutive_track_frames_(0)
     {
     }
 
     /**
+     * 设置当前裁剪框信息
+     */
+    void set_crop_region(float cx, float cy, float half_w, float half_h)
+    {
+        crop_center_x_ = cx;
+        crop_center_y_ = cy;
+        crop_half_w_ = half_w;
+        crop_half_h_ = half_h;
+        use_crop_center_bias_ = true;
+    }
+
+    /**
+     * 设置当前裁剪框中心（简化版）
+     */
+    void set_crop_center(float cx, float cy)
+    {
+        crop_center_x_ = cx;
+        crop_center_y_ = cy;
+        use_crop_center_bias_ = true;
+    }
+
+    void clear_crop_center_bias()
+    {
+        use_crop_center_bias_ = false;
+    }
+
+    /**
      * 从多个检测结果中选择目标球
-     * @param detections 所有球的检测结果
-     * @param tracker_prediction 跟踪器预测位置（如果有）
-     * @param has_tracker 是否有活跃的跟踪器
-     * @return 选中的目标球，如果没有合适的返回 nullptr
      */
     const T_DetectObject* select_target_ball(
         const std::vector<T_DetectObject>& detections,
         const T_TrackObject* tracker_prediction,
         bool has_tracker)
     {
+        current_frame_++;
+        
         if (detections.empty()) {
+            handle_no_detection();
             return nullptr;
         }
 
-        // 如果只有一个检测，直接返回（如果在有效区域内）
+        update_all_ball_history(detections);
+
+        // 单个检测时也要严格检查
         if (detections.size() == 1) {
-            if (is_in_valid_region(detections[0])) {
-                update_history(detections[0]);
+            const auto& det = detections[0];
+            if (is_in_valid_region(det) && is_acceptable_target(det)) {
+                // 额外检查：如果之前有目标且是运动的，新目标不能是静止的
+                if (target_was_moving_ && frames_since_target_lost_ < strict_protection_frames_) {
+                    BallHistory* hist = find_ball_history(det);
+                    if (hist != nullptr && !hist->ever_moved && hist->static_count > 5) {
+                        // 拒绝静止球
+                        handle_no_detection();
+                        return nullptr;
+                    }
+                }
+                update_locked_target(det);
                 return &detections[0];
             }
+            handle_no_detection();
             return nullptr;
         }
 
-        // 多个检测，需要筛选
         std::vector<BallCandidate> candidates;
         
         for (const auto& det : detections) {
             BallCandidate candidate;
             candidate.det = det;
             candidate.distance_to_tracker = 1e9f;
+            candidate.distance_to_crop_center = 1e9f;
+            candidate.distance_to_last_target = 1e9f;
             candidate.is_static = false;
             candidate.static_frames = 0;
+            candidate.ever_moved = false;
+            candidate.is_in_crop_region = false;
             candidate.priority_score = 0.0f;
 
-            // 第1层：区域过滤
             if (!is_in_valid_region(det)) {
-                continue;  // 跳过有效区域外的球
+                continue;
             }
 
-            // 第2层：静止球检测
-            check_static_ball(det, candidate);
-            if (candidate.is_static && candidate.static_frames > static_threshold_) {
-                continue;  // 跳过静止超过阈值的球
+            // 检查是否在裁剪框内
+            if (use_crop_center_bias_) {
+                candidate.is_in_crop_region = is_in_crop_region(det);
+                candidate.distance_to_crop_center = calculate_distance_to_crop_center(det);
             }
 
-            // 第3层：计算与跟踪器的距离
+            BallHistory* hist = find_ball_history(det);
+            if (hist != nullptr) {
+                candidate.is_static = hist->is_static;
+                candidate.static_frames = hist->static_count;
+                candidate.ever_moved = hist->ever_moved;
+            }
+
+            // ===== 严格的静止球过滤 =====
+            // 条件1：从未运动过且静止时间长
+            if (!candidate.ever_moved && candidate.static_frames > never_moved_threshold_) {
+                continue;
+            }
+            
+            // 条件2：如果之前跟踪的是运动球，且目标刚丢失不久，拒绝所有静止球
+            if (target_was_moving_ && 
+                frames_since_target_lost_ < strict_protection_frames_ &&
+                candidate.is_static && 
+                !candidate.ever_moved) {
+                continue;
+            }
+
+            // 条件3：不在裁剪框内的静止球，直接跳过
+            if (!candidate.is_in_crop_region && 
+                candidate.is_static && 
+                candidate.static_frames > 10) {
+                continue;
+            }
+
             if (has_tracker && tracker_prediction != nullptr) {
                 candidate.distance_to_tracker = calculate_distance(det, *tracker_prediction);
             }
 
-            // 计算综合优先级分数
-            candidate.priority_score = calculate_priority(candidate, has_tracker);
+            if (has_locked_target_) {
+                candidate.distance_to_last_target = calculate_distance_to_last_target(det);
+                
+                // 如果距离上一个目标位置太远，且目标刚丢失不久，大幅降低优先级
+                if (candidate.distance_to_last_target > target_switch_threshold_ && 
+                    frames_since_target_lost_ < target_search_grace_period_) {
+                    candidate.priority_score -= 800.0f;  // 加大惩罚
+                }
+            }
+
+            candidate.priority_score += calculate_priority(candidate, has_tracker);
 
             candidates.push_back(candidate);
         }
 
         if (candidates.empty()) {
+            handle_no_detection();
             return nullptr;
         }
 
-        // 按优先级排序，选择最高的
         std::sort(candidates.begin(), candidates.end(),
                   [](const BallCandidate& a, const BallCandidate& b) {
                       return a.priority_score > b.priority_score;
                   });
 
-        // 更新历史记录
-        update_history(candidates[0].det);
+        const auto& best = candidates[0];
+        
+        // 更严格的接受条件
+        if (best.priority_score < min_accept_score_) {
+            // 如果有锁定目标且刚丢失，拒绝低分候选
+            if (has_locked_target_ && frames_since_target_lost_ < strict_protection_frames_) {
+                handle_no_detection();
+                return nullptr;
+            }
+        }
 
-        // 返回原始 detections 中对应的指针
+        // 额外检查：如果最佳候选是静止球且不在裁剪框内，拒绝
+        if (best.is_static && !best.is_in_crop_region && !best.ever_moved) {
+            // 只有在已经丢失很久后才接受
+            if (frames_since_target_lost_ < extended_search_frames_) {
+                handle_no_detection();
+                return nullptr;
+            }
+        }
+
         for (const auto& det : detections) {
-            if (det.xmin == candidates[0].det.xmin &&
-                det.ymin == candidates[0].det.ymin) {
+            if (det.xmin == best.det.xmin && det.ymin == best.det.ymin) {
+                update_locked_target(det);
+                // 记录目标是否在运动
+                BallHistory* hist = find_ball_history(det);
+                if (hist != nullptr && hist->ever_moved) {
+                    target_was_moving_ = true;
+                }
                 return &det;
             }
         }
 
+        handle_no_detection();
         return nullptr;
     }
 
-    /**
-     * 重置历史记录（场景切换时调用）
-     */
-    void reset() {
-        ball_history_.clear();
+    bool should_trigger_fullframe_search() const
+    {
+        return has_locked_target_ && 
+               frames_since_target_lost_ >= target_search_grace_period_;
     }
 
+    void reset()
+    {
+        ball_history_.clear();
+        has_locked_target_ = false;
+        frames_since_target_lost_ = 0;
+        last_target_cx_ = 0;
+        last_target_cy_ = 0;
+        last_target_vx_ = 0;
+        last_target_vy_ = 0;
+        current_frame_ = 0;
+        use_crop_center_bias_ = false;
+        target_was_moving_ = false;
+        consecutive_track_frames_ = 0;
+    }
+
+    bool has_locked_target() const { return has_locked_target_; }
+    int get_frames_since_lost() const { return frames_since_target_lost_; }
+
 private:
-    // 有效区域边界
     int valid_left_;
     int valid_right_;
     int valid_top_;
     int valid_bottom_;
 
-    // 静止检测阈值
-    static constexpr int static_threshold_ = 30;      // 静止超过30帧视为干扰球
-    static constexpr float static_move_threshold_ = 10.0f;  // 移动小于10像素视为静止
+    // ===== 参数配置（调整后）=====
+    static constexpr int static_threshold_ = 20;           // 静止判定阈值（降低，更快判定为静止）
+    static constexpr int never_moved_threshold_ = 45;      // 从未运动阈值（降低）
+    static constexpr float static_move_threshold_ = 12.0f; // 静止移动阈值（降低，更严格）
+    static constexpr float move_detection_threshold_ = 30.0f; // 运动检测阈值
+    static constexpr float target_switch_threshold_ = 250.0f; // 目标切换距离阈值（降低）
+    static constexpr int target_search_grace_period_ = 15;    // 目标丢失宽限期（增加）
+    static constexpr int strict_protection_frames_ = 25;      // 严格保护期（新增）
+    static constexpr int extended_search_frames_ = 40;        // 扩展搜索帧数（新增）
+    static constexpr float min_accept_score_ = -50.0f;        // 最低可接受分数（提高）
 
-    // 历史检测记录（用于静止球检测）
     struct BallHistory {
-        float cx, cy;           // 中心位置
-        int static_count;       // 静止计数
-        int last_seen_frame;    // 最后出现帧
+        float cx, cy;
+        float initial_cx, initial_cy;
+        float total_movement;
+        int static_count;
+        int last_seen_frame;
+        int first_seen_frame;
+        bool is_static;
+        bool ever_moved;
     };
     std::vector<BallHistory> ball_history_;
-    int current_frame_ = 0;
+    int current_frame_;
 
-    /**
-     * 检查是否在有效区域内
-     */
-    bool is_in_valid_region(const T_DetectObject& det) {
+    bool has_locked_target_;
+    int frames_since_target_lost_;
+    float last_target_cx_, last_target_cy_;
+    float last_target_vx_, last_target_vy_;
+
+    // 裁剪框信息
+    float crop_center_x_, crop_center_y_;
+    float crop_half_w_, crop_half_h_;
+    bool use_crop_center_bias_;
+    
+    // 目标运动状态
+    bool target_was_moving_;
+    int consecutive_track_frames_;
+
+    bool is_in_valid_region(const T_DetectObject& det)
+    {
         float cx = (det.xmin + det.xmax) / 2.0f;
         float cy = (det.ymin + det.ymax) / 2.0f;
         
@@ -772,71 +941,169 @@ private:
     }
 
     /**
-     * 检查是否为静止球
+     * 检查球是否在裁剪框区域内
      */
-    void check_static_ball(const T_DetectObject& det, BallCandidate& candidate) {
+    bool is_in_crop_region(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        return (cx >= crop_center_x_ - crop_half_w_ &&
+                cx <= crop_center_x_ + crop_half_w_ &&
+                cy >= crop_center_y_ - crop_half_h_ &&
+                cy <= crop_center_y_ + crop_half_h_);
+    }
+
+    BallHistory* find_ball_history(const T_DetectObject& det)
+    {
         float cx = (det.xmin + det.xmax) / 2.0f;
         float cy = (det.ymin + det.ymax) / 2.0f;
 
-        // 查找历史记录中是否有相近位置的球
         for (auto& hist : ball_history_) {
             float dist = std::sqrt((cx - hist.cx) * (cx - hist.cx) + 
                                    (cy - hist.cy) * (cy - hist.cy));
             
-            if (dist < static_move_threshold_) {
-                // 位置相近，增加静止计数
-                hist.static_count++;
-                hist.last_seen_frame = current_frame_;
-                candidate.is_static = true;
-                candidate.static_frames = hist.static_count;
-                return;
+            if (dist < static_move_threshold_ * 2.5f) {
+                return &hist;
             }
         }
-
-        // 没有找到匹配的历史，这是新位置
-        candidate.is_static = false;
-        candidate.static_frames = 0;
+        return nullptr;
     }
 
-    /**
-     * 更新历史记录
-     */
-    void update_history(const T_DetectObject& det) {
-        current_frame_++;
-        
-        float cx = (det.xmin + det.xmax) / 2.0f;
-        float cy = (det.ymin + det.ymax) / 2.0f;
-
-        // 清理过期的历史记录
+    void update_all_ball_history(const std::vector<T_DetectObject>& detections)
+    {
         ball_history_.erase(
             std::remove_if(ball_history_.begin(), ball_history_.end(),
                 [this](const BallHistory& h) {
-                    return (current_frame_ - h.last_seen_frame) > 60;  // 60帧未出现则移除
+                    return (current_frame_ - h.last_seen_frame) > 150;
                 }),
             ball_history_.end());
 
-        // 查找并更新或添加新记录
-        for (auto& hist : ball_history_) {
-            float dist = std::sqrt((cx - hist.cx) * (cx - hist.cx) + 
-                                   (cy - hist.cy) * (cy - hist.cy));
-            if (dist < static_move_threshold_) {
-                hist.cx = cx;
-                hist.cy = cy;
-                hist.last_seen_frame = current_frame_;
-                return;
-            }
-        }
+        for (const auto& det : detections) {
+            float cx = (det.xmin + det.xmax) / 2.0f;
+            float cy = (det.ymin + det.ymax) / 2.0f;
 
-        // 添加新记录
-        if (ball_history_.size() < 20) {  // 最多记录20个位置
-            ball_history_.push_back({cx, cy, 0, current_frame_});
+            BallHistory* hist = find_ball_history(det);
+            
+            if (hist != nullptr) {
+                float move_dist = std::sqrt((cx - hist->cx) * (cx - hist->cx) + 
+                                            (cy - hist->cy) * (cy - hist->cy));
+                
+                hist->total_movement += move_dist;
+                
+                float dist_from_initial = std::sqrt(
+                    (cx - hist->initial_cx) * (cx - hist->initial_cx) + 
+                    (cy - hist->initial_cy) * (cy - hist->initial_cy));
+                
+                if (dist_from_initial > move_detection_threshold_) {
+                    hist->ever_moved = true;
+                }
+                
+                if (move_dist < static_move_threshold_) {
+                    hist->static_count++;
+                    hist->is_static = (hist->static_count > 3);  // 更快判定为静止
+                } else {
+                    hist->static_count = 0;
+                    hist->is_static = false;
+                }
+                
+                hist->cx = cx;
+                hist->cy = cy;
+                hist->last_seen_frame = current_frame_;
+            } else {
+                if (ball_history_.size() < 30) {
+                    BallHistory new_hist;
+                    new_hist.cx = cx;
+                    new_hist.cy = cy;
+                    new_hist.initial_cx = cx;
+                    new_hist.initial_cy = cy;
+                    new_hist.total_movement = 0.0f;
+                    new_hist.static_count = 0;
+                    new_hist.last_seen_frame = current_frame_;
+                    new_hist.first_seen_frame = current_frame_;
+                    new_hist.is_static = false;
+                    new_hist.ever_moved = false;
+                    ball_history_.push_back(new_hist);
+                }
+            }
         }
     }
 
-    /**
-     * 计算与跟踪器的距离
-     */
-    float calculate_distance(const T_DetectObject& det, const T_TrackObject& tracker) {
+    bool is_acceptable_target(const T_DetectObject& det)
+    {
+        BallHistory* hist = find_ball_history(det);
+        
+        if (hist == nullptr) {
+            return true;
+        }
+        
+        // 从未运动过且已经出现很久
+        if (!hist->ever_moved && 
+            (current_frame_ - hist->first_seen_frame) > never_moved_threshold_) {
+            return false;
+        }
+        
+        return true;
+    }
+
+    void update_locked_target(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        if (has_locked_target_) {
+            last_target_vx_ = cx - last_target_cx_;
+            last_target_vy_ = cy - last_target_cy_;
+        }
+        
+        last_target_cx_ = cx;
+        last_target_cy_ = cy;
+        has_locked_target_ = true;
+        frames_since_target_lost_ = 0;
+        consecutive_track_frames_++;
+    }
+
+    void handle_no_detection()
+    {
+        if (has_locked_target_) {
+            frames_since_target_lost_++;
+            
+            // 预测目标位置
+            last_target_cx_ += last_target_vx_;
+            last_target_cy_ += last_target_vy_;
+            
+            // 速度衰减
+            last_target_vx_ *= 0.85f;
+            last_target_vy_ *= 0.85f;
+            
+            // 丢失太久后重置运动状态
+            if (frames_since_target_lost_ > extended_search_frames_) {
+                target_was_moving_ = false;
+            }
+        }
+        consecutive_track_frames_ = 0;
+    }
+
+    float calculate_distance_to_last_target(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        return std::sqrt((cx - last_target_cx_) * (cx - last_target_cx_) + 
+                         (cy - last_target_cy_) * (cy - last_target_cy_));
+    }
+
+    float calculate_distance_to_crop_center(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        return std::sqrt((cx - crop_center_x_) * (cx - crop_center_x_) + 
+                         (cy - crop_center_y_) * (cy - crop_center_y_));
+    }
+
+    float calculate_distance(const T_DetectObject& det, const T_TrackObject& tracker)
+    {
         float det_cx = (det.xmin + det.xmax) / 2.0f;
         float det_cy = (det.ymin + det.ymax) / 2.0f;
         float trk_cx = (tracker.xmin + tracker.xmax) / 2.0f;
@@ -846,196 +1113,74 @@ private:
                          (det_cy - trk_cy) * (det_cy - trk_cy));
     }
 
-    /**
-     * 计算综合优先级分数
-     */
-    float calculate_priority(const BallCandidate& candidate, bool has_tracker) {
+    float calculate_priority(const BallCandidate& candidate, bool has_tracker)
+    {
         float score = 0.0f;
 
-        // 置信度分数（0~100）
+        // 1. 置信度分数
         score += candidate.det.score * 100.0f;
 
-        // 跟踪器距离分数（有跟踪器时，距离越近分数越高）
+        // 2. 跟踪器距离分数
         if (has_tracker && candidate.distance_to_tracker < 1e8f) {
-            // 距离在 500 像素内给予额外加分
             if (candidate.distance_to_tracker < 500.0f) {
-                score += (500.0f - candidate.distance_to_tracker) * 0.5f;  // 最多加 250 分
+                score += (500.0f - candidate.distance_to_tracker) * 0.5f;
             }
         }
 
-        // 静止惩罚（静止越久分数越低）
-        score -= candidate.static_frames * 2.0f;
+        // 3. 运动历史奖励（大幅增加）
+        if (candidate.ever_moved) {
+            score += 350.0f;  // 增加运动球的优势
+        }
 
-        // 位置偏好（靠近画面中心的球优先）
-        float cx = (candidate.det.xmin + candidate.det.xmax) / 2.0f;
-        float cy = (candidate.det.ymin + candidate.det.ymax) / 2.0f;
-        float center_x = (valid_left_ + valid_right_) / 2.0f;
-        float center_y = (valid_top_ + valid_bottom_) / 2.0f;
-        float dist_to_center = std::sqrt((cx - center_x) * (cx - center_x) + 
-                                          (cy - center_y) * (cy - center_y));
-        score -= dist_to_center * 0.01f;  // 轻微惩罚远离中心的球
+        // 4. 静止惩罚（加重）
+        if (candidate.is_static) {
+            score -= candidate.static_frames * 5.0f;  // 加重惩罚
+        }
+
+        // 5. 从未运动过的球额外惩罚（加重）
+        if (!candidate.ever_moved) {
+            if (candidate.static_frames > 5) {
+                score -= 400.0f;  // 大幅降分
+            }
+            if (candidate.static_frames > 15) {
+                score -= 300.0f;  // 继续降分
+            }
+        }
+
+        // 6. 与上次目标位置的距离（目标连续性）
+        if (has_locked_target_ && candidate.distance_to_last_target < 1e8f) {
+            if (candidate.distance_to_last_target < 150.0f) {
+                score += (150.0f - candidate.distance_to_last_target) * 2.0f;  // 增加权重
+            }
+            // 距离远的惩罚
+            if (candidate.distance_to_last_target > 300.0f) {
+                score -= (candidate.distance_to_last_target - 300.0f) * 0.5f;
+            }
+        }
+
+        // 7. 裁剪框内优先（大幅增加权重）
+        if (use_crop_center_bias_) {
+            if (candidate.is_in_crop_region) {
+                score += 300.0f;  // 裁剪框内的球大幅加分
+            } else {
+                // 裁剪框外的球降分，距离越远降得越多
+                if (candidate.distance_to_crop_center > 400.0f) {
+                    score -= 150.0f;
+                }
+                if (candidate.distance_to_crop_center > 800.0f) {
+                    score -= 250.0f;
+                }
+                if (candidate.distance_to_crop_center > 1200.0f) {
+                    score -= 350.0f;
+                }
+            }
+        }
 
         return score;
     }
 };
 
-/*------------------------------------------------*/
-/**
- * 图像分割检测器 - 将大图分割成多块分别检测
- */
-/*------------------------------------------------*/
-/**
- * 图像分割检测器 - 将大图分割成多块分别检测
- */
-class SplitDetector {
-public:
-    struct SplitRegion {
-        int x_offset;      // 在原图中的 X 偏移
-        int y_offset;      // 在原图中的 Y 偏移
-        int width;         // 区域宽度
-        int height;        // 区域高度
-    };
-
-    // 分割配置
-    static constexpr int SPLIT_WIDTH = 2560;       // 每块宽度
-    static constexpr int OVERLAP = 256;            // 重叠区域
-
-    /**
-     * 检查是否需要分割检测
-     */
-    static bool needs_split(int img_width) {
-        return img_width > SPLIT_WIDTH;
-    }
-
-    /**
-     * 计算分割区域
-     */
-    static std::vector<SplitRegion> calculate_split_regions(int img_width, int img_height) {
-        std::vector<SplitRegion> regions;
-
-        if (img_width <= SPLIT_WIDTH) {
-            regions.push_back({0, 0, img_width, img_height});
-            return regions;
-        }
-
-        int step = SPLIT_WIDTH - OVERLAP;
-        int x = 0;
-        
-        while (x < img_width) {
-            int region_width = std::min(SPLIT_WIDTH, img_width - x);
-            
-            if (img_width - x < SPLIT_WIDTH && x > 0) {
-                x = img_width - SPLIT_WIDTH;
-                region_width = SPLIT_WIDTH;
-            }
-            
-            regions.push_back({x, 0, region_width, img_height});
-            
-            if (x + region_width >= img_width) break;
-            x += step;
-        }
-
-        return regions;
-    }
-
-    /**
-     * 裁剪图像区域
-     */
-    static int crop_region(const image_buffer_t* src, image_buffer_t* dst,
-                           const SplitRegion& region) {
-        if (!src || !src->virt_addr || !dst) {
-            return -1;
-        }
-
-        int src_w = src->width;
-        int src_h = src->height;
-        int channels = 3;
-
-        size_t dst_size = region.width * region.height * channels;
-        
-        memset(dst, 0, sizeof(image_buffer_t));
-        dst->width = region.width;
-        dst->height = region.height;
-        dst->size = dst_size;
-        dst->format = src->format;
-        dst->fd = -1;
-        dst->virt_addr = (unsigned char*)malloc(dst_size);
-        if (!dst->virt_addr) {
-            return -1;
-        }
-
-        for (int y = 0; y < region.height; y++) {
-            int src_y = region.y_offset + y;
-            if (src_y >= src_h) break;
-
-            unsigned char* src_row = src->virt_addr + (src_y * src_w + region.x_offset) * channels;
-            unsigned char* dst_row = dst->virt_addr + (y * region.width) * channels;
-            
-            int copy_width = std::min(region.width, src_w - region.x_offset);
-            memcpy(dst_row, src_row, copy_width * channels);
-        }
-
-        return 0;
-    }
-
-    /**
-     * 将检测结果坐标还原到原图（加上区域偏移）
-     */
-    static void restore_to_original(const SplitRegion& region,
-                                    int& xmin, int& ymin, int& xmax, int& ymax) {
-        xmin += region.x_offset;
-        xmax += region.x_offset;
-        ymin += region.y_offset;
-        ymax += region.y_offset;
-    }
-
-    /**
-     * 合并多个区域的检测结果（去重）
-     */
-    static void merge_detections(std::vector<T_DetectObject>& all_detections,
-                                  const std::vector<T_DetectObject>& new_detections,
-                                  float iou_threshold = 0.5f) {
-        for (const auto& new_det : new_detections) {
-            bool is_duplicate = false;
-            
-            for (auto& existing : all_detections) {
-                float iou = calculate_iou(existing, new_det);
-                if (iou > iou_threshold) {
-                    if (new_det.score > existing.score) {
-                        existing = new_det;
-                    }
-                    is_duplicate = true;
-                    break;
-                }
-            }
-            
-            if (!is_duplicate) {
-                all_detections.push_back(new_det);
-            }
-        }
-    }
-
-private:
-    static float calculate_iou(const T_DetectObject& a, const T_DetectObject& b) {
-        float inter_left = std::max(a.xmin, b.xmin);
-        float inter_top = std::max(a.ymin, b.ymin);
-        float inter_right = std::min(a.xmax, b.xmax);
-        float inter_bottom = std::min(a.ymax, b.ymax);
-
-        if (inter_right <= inter_left || inter_bottom <= inter_top) {
-            return 0.0f;
-        }
-
-        float inter_area = (inter_right - inter_left) * (inter_bottom - inter_top);
-        float area_a = (a.xmax - a.xmin) * (a.ymax - a.ymin);
-        float area_b = (b.xmax - b.xmin) * (b.ymax - b.ymin);
-        float union_area = area_a + area_b - inter_area;
-
-        return inter_area / union_area;
-    }
-};
-
-//裁切输出版本
+//调试版本
 void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_path, const char *out_dir)
 {
     rknn_app_context_t rknn_app_ctx;
@@ -1069,13 +1214,21 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         VALID_BOTTOM
     );
 
-    DetectionAreaManager detect_manager(15, 3);
-
     // 球筛选器
     BallSelector ball_selector(0, PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
 
-    printf("[Consumer] Detection mode: CROP=%dx%d, FULLFRAME=%dx%d\n",
-           ALG_CROP_WIDTH, ALG_CROP_HEIGHT, PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
+    // 初始化状态
+    bool is_initialized = false;
+    int init_frames = 0;
+    static constexpr int MAX_INIT_FRAMES = 30;
+
+    // 上一帧的跟踪结果
+    T_TrackObject last_track_result;
+    bool has_last_track = false;
+
+    printf("[Consumer] === CROP OUTPUT MODE ===\n");
+    printf("[Consumer] Image size: %dx%d, Crop size: %dx%d\n",
+           PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
 
     while (true) {
         frame_track_count++;
@@ -1089,202 +1242,116 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             
             if (frame_count == 0) {
                 printf("[Consumer] Input resolution: %dx%d\n", src_image.width, src_image.height);
-                if (SplitDetector::needs_split(src_image.width)) {
-                    printf("[Consumer] Split detection enabled (width > %d)\n", SplitDetector::SPLIT_WIDTH);
-                }
             }
         }
         
         memset(&crop_image_buf, 0, sizeof(image_buffer_t));
 
-        bool is_fullframe_mode = detect_manager.is_fullframe_mode();
         bool found_ball = false;
         
         std::vector<T_DetectObject> all_ball_detections;
         std::vector<T_DetectObject> ball_detections;
         std::vector<T_TrackObject> track_results;
 
-        if (is_fullframe_mode) {
-            // ===== 全图检测模式 =====
-            camera.update_and_draw_only(&src_image);
+        // 获取当前裁剪框信息
+        image_rect_t crop_rect = camera.get_rect();
+        float crop_cx = (crop_rect.left + crop_rect.right) / 2.0f;
+        float crop_cy = (crop_rect.top + crop_rect.bottom) / 2.0f;
+
+        // 更新相机位置（不绘制红框到原图）
+        camera.update_position_only();
+
+        // ===== 始终使用全图检测 =====
+        object_detect_result_list od_results;
+        inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+        
+        for (int j = 0; j < od_results.count; j++) {
+            object_detect_result *det = &(od_results.results[j]);
+            char text[64];
+            snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
             
-            if (SplitDetector::needs_split(src_image.width)) {
-                // ===== 分割检测模式（大图）=====
-                auto regions = SplitDetector::calculate_split_regions(
-                    src_image.width, src_image.height);
-                
-                printf("[Consumer][FULLFRAME] Split into %zu regions\n", regions.size());
-
-                for (size_t i = 0; i < regions.size(); i++) {
-                    const auto& region = regions[i];
-                    
-                    // 裁剪区域
-                    image_buffer_t region_img = {0};
-                    ret = SplitDetector::crop_region(&src_image, &region_img, region);
-                    if (ret != 0) {
-                        printf("[Consumer] Crop region %zu failed\n", i);
-                        continue;
-                    }
-
-                    // 直接对裁剪区域推理（2560x1440 或更小）
-                    object_detect_result_list od_results;
-                    inference_yolov8_model(&rknn_app_ctx, &region_img, &od_results);
-
-                    // 处理检测结果
-                    std::vector<T_DetectObject> region_detections;
-                    for (int j = 0; j < od_results.count; j++) {
-                        object_detect_result *det = &(od_results.results[j]);
-                        char text[64];
-                        snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-                        
-                        if (strncmp(text, "ball", 4) == 0) {
-                            int xmin = det->box.left;
-                            int ymin = det->box.top;
-                            int xmax = det->box.right;
-                            int ymax = det->box.bottom;
-                            
-                            // 还原到原图坐标（加上区域偏移）
-                            SplitDetector::restore_to_original(region, xmin, ymin, xmax, ymax);
-                            
-                            T_DetectObject obj;
-                            obj.cls_id = det->cls_id;
-                            obj.score = det->prop;
-                            obj.xmin = xmin;
-                            obj.ymin = ymin;
-                            obj.xmax = xmax;
-                            obj.ymax = ymax;
-                            region_detections.push_back(obj);
-                            
-                            printf("[Consumer][FULLFRAME][Region%zu] Found ball @ orig(%d,%d,%d,%d) %.3f\n",
-                                   i, xmin, ymin, xmax, ymax, det->prop);
-                        }
-                    }
-
-                    // 合并检测结果（去重）
-                    SplitDetector::merge_detections(all_ball_detections, region_detections);
-
-                    // 释放区域图像
-                    if (region_img.virt_addr) {
-                        free(region_img.virt_addr);
-                        region_img.virt_addr = NULL;
-                    }
-                }
-            } else {
-                // ===== 普通全图检测（不需要分割）=====
-                object_detect_result_list od_results;
-                inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
-                
-                for (int j = 0; j < od_results.count; j++) {
-                    object_detect_result *det = &(od_results.results[j]);
-                    char text[64];
-                    snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-                    
-                    if (strncmp(text, "ball", 4) == 0) {
-                        T_DetectObject obj;
-                        obj.cls_id = det->cls_id;
-                        obj.score = det->prop;
-                        obj.xmin = det->box.left;
-                        obj.ymin = det->box.top;
-                        obj.xmax = det->box.right;
-                        obj.ymax = det->box.bottom;
-                        all_ball_detections.push_back(obj);
-                        
-                        printf("[Consumer][FULLFRAME] Found ball @ (%d,%d,%d,%d) %.3f\n",
-                               det->box.left, det->box.top, det->box.right, det->box.bottom, det->prop);
-                    }
-                }
-            }
-            
-            // 裁剪输出图像
-            camera.crop_current_window(&src_image, &crop_image_buf);
-
-        } else {
-            // ===== 裁剪区域检测模式 =====
-            camera.get_crop_window(&src_image, &crop_image_buf);
-
-            if (crop_image_buf.virt_addr == NULL) {
-                printf("[Consumer] crop_image is NULL\n");
-                pool.release(src_image);
-                memset(&src_image, 0, sizeof(image_buffer_t));
-                continue;
-            }
-
-            object_detect_result_list od_results;
-            inference_yolov8_model(&rknn_app_ctx, &crop_image_buf, &od_results);
-
-            for (int j = 0; j < od_results.count; j++) {
-                object_detect_result *det = &(od_results.results[j]);
-                char text[64];
-                snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-                
-                if (strncmp(text, "ball", 4) == 0) {
-                    T_DetectObject obj;
-                    obj.cls_id = det->cls_id;
-                    obj.score = det->prop;
-                    // 裁剪图坐标 → 原图坐标
-                    obj.xmin = camera.get_rect().left + det->box.left;
-                    obj.ymin = camera.get_rect().top + det->box.top;
-                    obj.xmax = camera.get_rect().left + det->box.right;
-                    obj.ymax = camera.get_rect().top + det->box.bottom;
-                    all_ball_detections.push_back(obj);
-                }
+            if (strncmp(text, "ball", 4) == 0) {
+                T_DetectObject obj;
+                obj.cls_id = det->cls_id;
+                obj.score = det->prop;
+                obj.xmin = det->box.left;
+                obj.ymin = det->box.top;
+                obj.xmax = det->box.right;
+                obj.ymax = det->box.bottom;
+                all_ball_detections.push_back(obj);
             }
         }
+        
+        // 裁剪输出图
+        camera.crop_current_window(&src_image, &crop_image_buf);
 
-        // ===== 球筛选：从多个检测中选择目标球 =====
+        // 设置裁剪框中心偏好
+        ball_selector.set_crop_center(crop_cx, crop_cy);
+
+        // ===== 球筛选 =====
         if (!all_ball_detections.empty()) {
-            T_TrackObject tracker_pred;
-            bool has_tracker = tracker.HasActiveTrack();
-            
-            const T_DetectObject* target = ball_selector.select_target_ball(
+            const T_DetectObject *target = ball_selector.select_target_ball(
                 all_ball_detections,
-                has_tracker ? &tracker_pred : nullptr,
-                has_tracker
-            );
-            
+                has_last_track ? &last_track_result : nullptr,
+                has_last_track);
+
             if (target != nullptr) {
                 ball_detections.push_back(*target);
                 found_ball = true;
-                
-                printf("[Consumer] Selected target ball @ (%d,%d,%d,%d) from %zu candidates\n",
-                       (int)target->xmin, (int)target->ymin,
-                       (int)target->xmax, (int)target->ymax,
-                       all_ball_detections.size());
             }
         }
 
-        // ===== 统一的跟踪处理 =====
+        // ===== 初始化阶段处理 =====
+        if (!is_initialized) {
+            init_frames++;
+            if (found_ball) {
+                const auto& target = ball_detections[0];
+                float target_cx = (target.xmin + target.xmax) / 2.0f;
+                float target_cy = (target.ymin + target.ymax) / 2.0f;
+                
+                camera.set_center(target_cx, target_cy);
+                
+                is_initialized = true;
+                printf("[Consumer][INIT] Target acquired at (%.0f, %.0f)\n", target_cx, target_cy);
+            } else {
+                if (init_frames >= MAX_INIT_FRAMES) {
+                    printf("[Consumer][INIT] Max init frames reached\n");
+                    is_initialized = true;
+                }
+            }
+        }
+
+        // ===== 跟踪处理 =====
         if (!ball_detections.empty() || tracker.HasActiveTrack()) {
             tracker.ProcessFrame(frame_track_count, ball_detections, track_results);
         }
 
-        // ===== 统一的绘图处理 =====
-        if (crop_image_buf.virt_addr != NULL) {
-            // 绘制所有检测到的球（白色细框，调试用）
-            for (const auto& det : all_ball_detections) {
-                int crop_x1 = det.xmin - camera.get_rect().left;
-                int crop_y1 = det.ymin - camera.get_rect().top;
-                int crop_x2 = det.xmax - camera.get_rect().left;
-                int crop_y2 = det.ymax - camera.get_rect().top;
-                
-                if (crop_x1 >= 0 && crop_y1 >= 0 && 
-                    crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
-                    draw_rectangle(&crop_image_buf, 
-                                   crop_x1, crop_y1,
-                                   crop_x2 - crop_x1, crop_y2 - crop_y1,
-                                   COLOR_WHITE, 1);
-                }
-            }
+        // ===== 保存当前帧跟踪结果 =====
+        if (!track_results.empty()) {
+            last_track_result = track_results[0];
+            has_last_track = true;
+        } else if (!tracker.HasActiveTrack()) {
+            has_last_track = false;
+        }
 
-            // 绘制选中的目标球（蓝色粗框）
+        // ===== 在裁剪图上绘制 =====
+        if (crop_image_buf.virt_addr != NULL) {
+            // 选中的目标球（蓝色粗框）- 转换到裁剪图坐标
             for (const auto& det : ball_detections) {
-                int crop_x1 = det.xmin - camera.get_rect().left;
-                int crop_y1 = det.ymin - camera.get_rect().top;
-                int crop_x2 = det.xmax - camera.get_rect().left;
-                int crop_y2 = det.ymax - camera.get_rect().top;
+                int crop_x1 = det.xmin - crop_rect.left;
+                int crop_y1 = det.ymin - crop_rect.top;
+                int crop_x2 = det.xmax - crop_rect.left;
+                int crop_y2 = det.ymax - crop_rect.top;
                 
-                if (crop_x1 >= 0 && crop_y1 >= 0 && 
-                    crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
+                // 检查是否在裁剪图范围内
+                if (crop_x1 < ALG_CROP_WIDTH && crop_y1 < ALG_CROP_HEIGHT &&
+                    crop_x2 > 0 && crop_y2 > 0) {
+                    // 裁剪到有效范围
+                    crop_x1 = std::max(0, crop_x1);
+                    crop_y1 = std::max(0, crop_y1);
+                    crop_x2 = std::min(ALG_CROP_WIDTH, crop_x2);
+                    crop_y2 = std::min(ALG_CROP_HEIGHT, crop_y2);
+                    
                     draw_rectangle(&crop_image_buf, 
                                    crop_x1, crop_y1,
                                    crop_x2 - crop_x1, crop_y2 - crop_y1,
@@ -1292,25 +1359,32 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                     
                     char text[64];
                     snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
-                    draw_text(&crop_image_buf, text, crop_x1, crop_y1 - 20, COLOR_RED, 10);
+                    if (crop_y1 > 25) {
+                        draw_text(&crop_image_buf, text, crop_x1, crop_y1 - 20, COLOR_RED, 10);
+                    }
                 }
             }
             
-            // 绘制跟踪框（绿色）
+            // 跟踪框（绿色）- 转换到裁剪图坐标
             for (const auto& trk : track_results) {
-                int crop_x1 = trk.xmin - camera.get_rect().left;
-                int crop_y1 = trk.ymin - camera.get_rect().top;
-                int crop_x2 = trk.xmax - camera.get_rect().left;
-                int crop_y2 = trk.ymax - camera.get_rect().top;
+                int crop_x1 = trk.xmin - crop_rect.left;
+                int crop_y1 = trk.ymin - crop_rect.top;
+                int crop_x2 = trk.xmax - crop_rect.left;
+                int crop_y2 = trk.ymax - crop_rect.top;
                 
-                if (crop_x1 >= 0 && crop_y1 >= 0 && 
-                    crop_x2 <= ALG_CROP_WIDTH && crop_y2 <= ALG_CROP_HEIGHT) {
+                if (crop_x1 < ALG_CROP_WIDTH && crop_y1 < ALG_CROP_HEIGHT &&
+                    crop_x2 > 0 && crop_y2 > 0) {
+                    crop_x1 = std::max(0, crop_x1);
+                    crop_y1 = std::max(0, crop_y1);
+                    crop_x2 = std::min(ALG_CROP_WIDTH, crop_x2);
+                    crop_y2 = std::min(ALG_CROP_HEIGHT, crop_y2);
+                    
                     draw_rectangle(&crop_image_buf, 
                                    crop_x1, crop_y1,
                                    crop_x2 - crop_x1, crop_y2 - crop_y1,
                                    COLOR_GREEN, 3);
                     
-                    if (trk.is_predicted) {
+                    if (trk.is_predicted && crop_y1 > 45) {
                         draw_text(&crop_image_buf, "[PRED]", crop_x1, crop_y1 - 40, COLOR_YELLOW, 10);
                     }
                 }
@@ -1318,28 +1392,25 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             
             // 调试信息
             char debug_text[128];
-            snprintf(debug_text, sizeof(debug_text), "Mode:%s Balls:%zu->%zu Dist:%.1f",
-                     is_fullframe_mode ? "FULL" : "CROP",
+            snprintf(debug_text, sizeof(debug_text), "Balls:%zu->%zu Lost:%d",
                      all_ball_detections.size(),
                      ball_detections.size(),
-                     tracker.GetLastGatingDistance());
-            draw_text(&crop_image_buf, debug_text, 10, 20, COLOR_YELLOW, 12);
+                     ball_selector.get_frames_since_lost());
+            draw_text(&crop_image_buf, debug_text, 10, 25, COLOR_YELLOW, 12);
         }
 
         // ===== 更新运镜 =====
-        if (!track_results.empty()) {
+        if (is_initialized && !track_results.empty()) {
             auto &t = track_results[0];
             camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
         }
 
-        // ===== 更新检测模式 =====
-        detect_manager.report_detection(found_ball);
-        
+        // ===== 无目标时标记 =====
         if (!found_ball) {
             camera.mark_no_target();
         }
 
-        // ===== 保存输出 =====
+        // ===== 保存裁剪图 =====
         if (crop_image_buf.virt_addr != NULL) {
             char out_path[256];
             snprintf(out_path, sizeof(out_path), "%s/%06d.jpg", out_dir, frame_count);
@@ -1347,12 +1418,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         }
         
         frame_count++;
-        
-        if (frame_count % 100 == 0) {
-            printf("[Consumer] Processed %d frames, mode: %s\n", 
-                   frame_count,
-                   detect_manager.is_fullframe_mode() ? "FULLFRAME" : "CROP");
-        }
         
         if (crop_image_buf.virt_addr) {
             free(crop_image_buf.virt_addr);
@@ -1369,310 +1434,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     release_yolov8_model(&rknn_app_ctx);
 }
 
-//调试版本
-// void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_path, const char *out_dir)
-// {
-//     rknn_app_context_t rknn_app_ctx;
-//     memset(&rknn_app_ctx, 0, sizeof(rknn_app_context_t));
-
-//     init_post_process();
-//     int ret = init_yolov8_model(model_path, &rknn_app_ctx);
-//     if (ret) {
-//         printf("[Consumer] init_yolov8_model failed!\n");
-//         return;
-//     }
-
-//     char cmd[256];
-//     snprintf(cmd, sizeof(cmd), "mkdir -p %s", out_dir);
-//     system(cmd);
-
-//     int frame_count = 0;
-//     int frame_track_count = 0;
-//     image_buffer_t src_image = {0};
-//     image_buffer_t crop_image_buf = {0};
-    
-//     TrackFrame tracker;
-//     tracker.Init(50);
-    
-//     SmoothCameraController camera(
-//         PIC_FULL_WIDTH, 
-//         PIC_FULL_HEIGHT, 
-//         ALG_CROP_WIDTH, 
-//         ALG_CROP_HEIGHT,
-//         VALID_TOP,
-//         VALID_BOTTOM
-//     );
-
-//     DetectionAreaManager detect_manager(15, 3);
-
-//     // 球筛选器
-//     BallSelector ball_selector(0, PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
-
-//     printf("[Consumer][DEBUG] Output: FULL IMAGE with crop window\n");
-//     printf("[Consumer] Detection mode: CROP=%dx%d, FULLFRAME=%dx%d\n",
-//            ALG_CROP_WIDTH, ALG_CROP_HEIGHT, PIC_FULL_WIDTH, PIC_FULL_HEIGHT);
-
-//     while (true) {
-//         frame_track_count++;
-        
-//         if (src_image.width == 0 && src_image.height == 0) {
-//             memset(&src_image, 0, sizeof(image_buffer_t));
-//             if (!fq.pop(src_image)) {
-//                 printf("[Consumer] Queue stopped, exiting\n");
-//                 break;
-//             }
-            
-//             if (frame_count == 0) {
-//                 printf("[Consumer] Input resolution: %dx%d\n", src_image.width, src_image.height);
-//                 if (SplitDetector::needs_split(src_image.width)) {
-//                     printf("[Consumer] Split detection enabled (width > %d)\n", SplitDetector::SPLIT_WIDTH);
-//                 }
-//             }
-//         }
-        
-//         memset(&crop_image_buf, 0, sizeof(image_buffer_t));
-
-//         bool is_fullframe_mode = detect_manager.is_fullframe_mode();
-//         bool found_ball = false;
-        
-//         std::vector<T_DetectObject> all_ball_detections;
-//         std::vector<T_DetectObject> ball_detections;
-//         std::vector<T_TrackObject> track_results;
-
-//         if (is_fullframe_mode) {
-//             // ===== 全图检测模式 =====
-//             camera.update_and_draw_only(&src_image);
-            
-//             if (SplitDetector::needs_split(src_image.width)) {
-//                 // ===== 分割检测模式（大图）=====
-//                 auto regions = SplitDetector::calculate_split_regions(
-//                     src_image.width, src_image.height);
-
-//                 for (size_t i = 0; i < regions.size(); i++) {
-//                     const auto& region = regions[i];
-                    
-//                     image_buffer_t region_img = {0};
-//                     ret = SplitDetector::crop_region(&src_image, &region_img, region);
-//                     if (ret != 0) {
-//                         continue;
-//                     }
-
-//                     object_detect_result_list od_results;
-//                     inference_yolov8_model(&rknn_app_ctx, &region_img, &od_results);
-
-//                     std::vector<T_DetectObject> region_detections;
-//                     for (int j = 0; j < od_results.count; j++) {
-//                         object_detect_result *det = &(od_results.results[j]);
-//                         char text[64];
-//                         snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-                        
-//                         if (strncmp(text, "ball", 4) == 0) {
-//                             int xmin = det->box.left;
-//                             int ymin = det->box.top;
-//                             int xmax = det->box.right;
-//                             int ymax = det->box.bottom;
-                            
-//                             SplitDetector::restore_to_original(region, xmin, ymin, xmax, ymax);
-                            
-//                             T_DetectObject obj;
-//                             obj.cls_id = det->cls_id;
-//                             obj.score = det->prop;
-//                             obj.xmin = xmin;
-//                             obj.ymin = ymin;
-//                             obj.xmax = xmax;
-//                             obj.ymax = ymax;
-//                             region_detections.push_back(obj);
-//                         }
-//                     }
-
-//                     SplitDetector::merge_detections(all_ball_detections, region_detections);
-
-//                     if (region_img.virt_addr) {
-//                         free(region_img.virt_addr);
-//                         region_img.virt_addr = NULL;
-//                     }
-//                 }
-//             } else {
-//                 // ===== 普通全图检测 =====
-//                 object_detect_result_list od_results;
-//                 inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
-                
-//                 for (int j = 0; j < od_results.count; j++) {
-//                     object_detect_result *det = &(od_results.results[j]);
-//                     char text[64];
-//                     snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-                    
-//                     if (strncmp(text, "ball", 4) == 0) {
-//                         T_DetectObject obj;
-//                         obj.cls_id = det->cls_id;
-//                         obj.score = det->prop;
-//                         obj.xmin = det->box.left;
-//                         obj.ymin = det->box.top;
-//                         obj.xmax = det->box.right;
-//                         obj.ymax = det->box.bottom;
-//                         all_ball_detections.push_back(obj);
-//                     }
-//                 }
-//             }
-            
-//             // 仍然需要裁剪图用于检测（但不输出）
-//             camera.crop_current_window(&src_image, &crop_image_buf);
-
-//         } else {
-//             // ===== 裁剪区域检测模式 =====
-//             camera.get_crop_window(&src_image, &crop_image_buf);
-
-//             if (crop_image_buf.virt_addr == NULL) {
-//                 printf("[Consumer] crop_image is NULL\n");
-//                 pool.release(src_image);
-//                 memset(&src_image, 0, sizeof(image_buffer_t));
-//                 continue;
-//             }
-
-//             object_detect_result_list od_results;
-//             inference_yolov8_model(&rknn_app_ctx, &crop_image_buf, &od_results);
-
-//             for (int j = 0; j < od_results.count; j++) {
-//                 object_detect_result *det = &(od_results.results[j]);
-//                 char text[64];
-//                 snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-                
-//                 if (strncmp(text, "ball", 4) == 0) {
-//                     T_DetectObject obj;
-//                     obj.cls_id = det->cls_id;
-//                     obj.score = det->prop;
-//                     obj.xmin = camera.get_rect().left + det->box.left;
-//                     obj.ymin = camera.get_rect().top + det->box.top;
-//                     obj.xmax = camera.get_rect().left + det->box.right;
-//                     obj.ymax = camera.get_rect().top + det->box.bottom;
-//                     all_ball_detections.push_back(obj);
-//                 }
-//             }
-//         }
-
-//         // ===== 球筛选 =====
-//         if (!all_ball_detections.empty()) {
-//             T_TrackObject tracker_pred;
-//             bool has_tracker = tracker.HasActiveTrack();
-            
-//             const T_DetectObject* target = ball_selector.select_target_ball(
-//                 all_ball_detections,
-//                 has_tracker ? &tracker_pred : nullptr,
-//                 has_tracker
-//             );
-            
-//             if (target != nullptr) {
-//                 ball_detections.push_back(*target);
-//                 found_ball = true;
-//             }
-//         }
-
-//         // ===== 跟踪处理 =====
-//         if (!ball_detections.empty() || tracker.HasActiveTrack()) {
-//             tracker.ProcessFrame(frame_track_count, ball_detections, track_results);
-//         }
-
-//         // ===== 在原图上绘制（调试模式）=====
-//         {
-//             // 1. 绘制裁剪窗口（红色粗框）
-//             image_rect_t crop_rect = camera.get_rect();
-//             draw_rectangle(&src_image, 
-//                            crop_rect.left, crop_rect.top,
-//                            crop_rect.right - crop_rect.left, 
-//                            crop_rect.bottom - crop_rect.top,
-//                            COLOR_RED, 4);
-
-//             // 2. 绘制所有检测到的球（白色细框）
-//             for (const auto& det : all_ball_detections) {
-//                 draw_rectangle(&src_image, 
-//                                det.xmin, det.ymin,
-//                                det.xmax - det.xmin, det.ymax - det.ymin,
-//                                COLOR_WHITE, 1);
-//             }
-
-//             // 3. 绘制选中的目标球（蓝色粗框）
-//             for (const auto& det : ball_detections) {
-//                 draw_rectangle(&src_image, 
-//                                det.xmin, det.ymin,
-//                                det.xmax - det.xmin, det.ymax - det.ymin,
-//                                COLOR_BLUE, 3);
-                
-//                 char text[64];
-//                 snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
-//                 draw_text(&src_image, text, det.xmin, det.ymin - 20, COLOR_RED, 10);
-//             }
-            
-//             // 4. 绘制跟踪框（绿色）
-//             for (const auto& trk : track_results) {
-//                 draw_rectangle(&src_image, 
-//                                trk.xmin, trk.ymin,
-//                                trk.xmax - trk.xmin, trk.ymax - trk.ymin,
-//                                COLOR_GREEN, 3);
-                
-//                 if (trk.is_predicted) {
-//                     draw_text(&src_image, "[PRED]", trk.xmin, trk.ymin - 40, COLOR_YELLOW, 10);
-//                 }
-//             }
-            
-//             // 5. 调试信息（左上角）
-//             char debug_text[128];
-//             snprintf(debug_text, sizeof(debug_text), "Mode:%s Balls:%zu->%zu Dist:%.1f",
-//                      is_fullframe_mode ? "FULL" : "CROP",
-//                      all_ball_detections.size(),
-//                      ball_detections.size(),
-//                      tracker.GetLastGatingDistance());
-//             draw_text(&src_image, debug_text, 10, 30, COLOR_YELLOW, 15);
-            
-//             // 6. 裁剪窗口位置信息
-//             char crop_info[64];
-//             snprintf(crop_info, sizeof(crop_info), "Crop:[%d,%d]-[%d,%d]",
-//                      crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom);
-//             draw_text(&src_image, crop_info, 10, 60, COLOR_RED, 12);
-//         }
-
-//         // ===== 更新运镜 =====
-//         if (!track_results.empty()) {
-//             auto &t = track_results[0];
-//             camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
-//         }
-
-//         // ===== 更新检测模式 =====
-//         detect_manager.report_detection(found_ball);
-        
-//         if (!found_ball) {
-//             camera.mark_no_target();
-//         }
-
-//         // ===== 保存原图（调试模式）=====
-//         {
-//             char out_path[256];
-//             snprintf(out_path, sizeof(out_path), "%s/%06d.jpg", out_dir, frame_count);
-//             write_image(out_path, &src_image);  // 输出原图
-//         }
-        
-//         frame_count++;
-        
-//         if (frame_count % 100 == 0) {
-//             printf("[Consumer] Processed %d frames, mode: %s\n", 
-//                    frame_count,
-//                    detect_manager.is_fullframe_mode() ? "FULLFRAME" : "CROP");
-//         }
-        
-//         // 释放裁剪图内存（仍然需要释放）
-//         if (crop_image_buf.virt_addr) {
-//             free(crop_image_buf.virt_addr);
-//             crop_image_buf.virt_addr = NULL;
-//         }
-        
-//         pool.release(src_image);
-//         memset(&src_image, 0, sizeof(image_buffer_t));
-//     }
-
-//     printf("[Consumer] Finished processing %d frames\n", frame_count);
-
-//     deinit_post_process();
-//     release_yolov8_model(&rknn_app_ctx);
-// }
 /*-----------------------------------------------*/
 int main(int argc, char* argv[])
 {
