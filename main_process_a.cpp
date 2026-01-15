@@ -35,7 +35,7 @@
 #define ALG_CROP_WIDTH 1920
 #define ALG_CROP_HEIGHT 860
 #define VALID_TOP 476  //最小155
-#define VALID_BOTTOM (ALG_CROP_HEIGHT + VALID_TOP)  // 1440 - 155 = 1285
+#define VALID_BOTTOM (860 + VALID_TOP)  // 1440 - 155 = 1285
 
 // ===== 全局退出标志 =====
 static std::atomic<bool> g_exit{false};
@@ -1623,6 +1623,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
            EXCLUDE_RIGHT_START, PIC_FULL_WIDTH - EXCLUDE_RIGHT_START);
     printf("[Consumer] Split regions: Left[0-%d], Right[%d-%d]\n",
            HALF_WIDTH, HALF_WIDTH, PIC_FULL_WIDTH);
+    printf("[Consumer] Output: CROPPED (%dx%d)\n", ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
 
     while (true) {
         frame_track_count++;
@@ -1795,9 +1796,6 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             }
         }
 
-        // 裁剪输出图（用于内部处理，但不输出）
-        camera.crop_current_window(&src_image, &crop_image_buf);
-
         // 设置裁剪框中心偏好
         ball_selector.set_crop_center(crop_cx, crop_cy);
 
@@ -1855,116 +1853,143 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         auto blacklist_positions = ball_selector.get_blacklist_positions();
         auto other_court_positions = ball_selector.get_other_court_positions();
 
-        // ===== 在原图上绘制 =====
-        {
-            // 绘制右侧排除区域（灰色框）
-            draw_rectangle(&src_image, 
-                           EXCLUDE_RIGHT_START, VALID_TOP,
-                           PIC_FULL_WIDTH - EXCLUDE_RIGHT_START, VALID_HEIGHT,
-                           COLOR_GRAY, 3);
-            
-            // 绘制左右分区线（黄色）
-            draw_rectangle(&src_image, 
-                           HALF_WIDTH - 1, VALID_TOP,
-                           2, VALID_HEIGHT,
-                           COLOR_YELLOW, 1);
+        // ===== 更新运镜 =====
+        if (is_initialized && !track_results.empty()) {
+            auto &t = track_results[0];
+            camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
+        }
 
-            // ===== 绘制黑名单位置（紫色/品红色 圆圈 + X标记）=====
+        // ===== 无目标时标记 =====
+        if (!found_ball) {
+            camera.mark_no_target();
+        }
+
+        // ===== 裁剪输出图 =====
+        camera.crop_current_window(&src_image, &crop_image_buf);
+
+        // ===== 在裁切图上绘制 =====
+        {
+            // 坐标转换辅助lambda：全图坐标 -> 裁切图坐标
+            auto to_crop_x = [&crop_rect](int full_x) -> int {
+                return full_x - crop_rect.left;
+            };
+            auto to_crop_y = [&crop_rect](int full_y) -> int {
+                return full_y - crop_rect.top;
+            };
+            auto is_in_crop = [&crop_rect](int full_x, int full_y) -> bool {
+                return full_x >= crop_rect.left && full_x < crop_rect.right &&
+                       full_y >= crop_rect.top && full_y < crop_rect.bottom;
+            };
+
+            // ===== 绘制黑名单位置（紫色方框 + X标记）=====
             for (const auto& pos : blacklist_positions) {
                 int cx = static_cast<int>(pos.first);
                 int cy = static_cast<int>(pos.second);
+                
+                if (!is_in_crop(cx, cy)) continue;
+                
+                int crop_cx_pos = to_crop_x(cx);
+                int crop_cy_pos = to_crop_y(cy);
                 int radius = 45;
                 
-                // 画圆圈
-                draw_rectangle(&src_image,
-                               cx - radius, cy - radius,
+                // 画方框
+                draw_rectangle(&crop_image_buf,
+                               crop_cx_pos - radius, crop_cy_pos - radius,
                                radius * 2, radius * 2,
                                COLOR_PURPLE, 3);
                 
                 // 画X标记
-                // 左上到右下
                 for (int i = -radius + 5; i < radius - 5; i++) {
-                    int px = cx + i;
-                    int py = cy + i;
-                    if (px >= 0 && px < PIC_FULL_WIDTH && py >= 0 && py < PIC_FULL_HEIGHT) {
-                        // 简单的点绘制（如果有draw_line可以用draw_line）
-                        draw_rectangle(&src_image, px, py, 3, 3, COLOR_PURPLE, 1);
-                    }
-                }
-                // 右上到左下
-                for (int i = -radius + 5; i < radius - 5; i++) {
-                    int px = cx + i;
-                    int py = cy - i;
-                    if (px >= 0 && px < PIC_FULL_WIDTH && py >= 0 && py < PIC_FULL_HEIGHT) {
-                        draw_rectangle(&src_image, px, py, 3, 3, COLOR_PURPLE, 1);
+                    int px = crop_cx_pos + i;
+                    int py1 = crop_cy_pos + i;
+                    int py2 = crop_cy_pos - i;
+                    if (px >= 0 && px < ALG_CROP_WIDTH) {
+                        if (py1 >= 0 && py1 < ALG_CROP_HEIGHT) {
+                            draw_rectangle(&crop_image_buf, px, py1, 3, 3, COLOR_PURPLE, 1);
+                        }
+                        if (py2 >= 0 && py2 < ALG_CROP_HEIGHT) {
+                            draw_rectangle(&crop_image_buf, px, py2, 3, 3, COLOR_PURPLE, 1);
+                        }
                     }
                 }
                 
                 // 标签
-                draw_text(&src_image, "[BLACKLIST]", cx - 40, cy - radius - 25, COLOR_PURPLE, 12);
+                if (crop_cy_pos - radius - 25 > 0) {
+                    draw_text(&crop_image_buf, "[BLACKLIST]", crop_cx_pos - 40, crop_cy_pos - radius - 25, COLOR_PURPLE, 12);
+                }
             }
 
-            // ===== 绘制其他球场的球（橙色 圆圈）=====
+            // ===== 绘制其他球场的球（橙色方框）=====
             for (const auto& pos : other_court_positions) {
                 int cx = static_cast<int>(pos.first);
                 int cy = static_cast<int>(pos.second);
+                
+                if (!is_in_crop(cx, cy)) continue;
+                
+                int crop_cx_pos = to_crop_x(cx);
+                int crop_cy_pos = to_crop_y(cy);
                 int radius = 40;
                 
-                // 画圆圈（用矩形框近似）
-                draw_rectangle(&src_image,
-                               cx - radius, cy - radius,
+                draw_rectangle(&crop_image_buf,
+                               crop_cx_pos - radius, crop_cy_pos - radius,
                                radius * 2, radius * 2,
                                COLOR_ORANGE, 3);
                 
-                // 标签
-                draw_text(&src_image, "[OTHER COURT]", cx - 50, cy - radius - 25, COLOR_ORANGE, 12);
-            }
-
-            // 裁剪窗口（红色粗框）
-            draw_rectangle(&src_image, 
-                           crop_rect.left, crop_rect.top,
-                           crop_rect.right - crop_rect.left, 
-                           crop_rect.bottom - crop_rect.top,
-                           COLOR_RED, 4);
-
-            // 被排除的检测（灰色细框 + 标记）
-            for (const auto& det : excluded_detections) {
-                draw_rectangle(&src_image, 
-                               det.xmin, det.ymin,
-                               det.xmax - det.xmin, det.ymax - det.ymin,
-                               COLOR_GRAY, 2);
-                draw_text(&src_image, "[EXCLUDED]", det.xmin, det.ymin - 25, COLOR_GRAY, 10);
+                if (crop_cy_pos - radius - 25 > 0) {
+                    draw_text(&crop_image_buf, "[OTHER COURT]", crop_cx_pos - 50, crop_cy_pos - radius - 25, COLOR_ORANGE, 12);
+                }
             }
 
             // 有效检测到的球（白色细框）
             for (const auto& det : valid_ball_detections) {
-                draw_rectangle(&src_image, 
-                               det.xmin, det.ymin,
-                               det.xmax - det.xmin, det.ymax - det.ymin,
-                               COLOR_WHITE, 1);
+                int x1 = to_crop_x(det.xmin);
+                int y1 = to_crop_y(det.ymin);
+                int w = det.xmax - det.xmin;
+                int h = det.ymax - det.ymin;
+                
+                // 检查是否在裁切区域内
+                if (x1 + w < 0 || x1 >= ALG_CROP_WIDTH || y1 + h < 0 || y1 >= ALG_CROP_HEIGHT) {
+                    continue;
+                }
+                
+                draw_rectangle(&crop_image_buf, x1, y1, w, h, COLOR_WHITE, 1);
             }
 
             // 选中的目标球（蓝色粗框）
             for (const auto& det : ball_detections) {
-                draw_rectangle(&src_image, 
-                               det.xmin, det.ymin,
-                               det.xmax - det.xmin, det.ymax - det.ymin,
-                               COLOR_BLUE, 3);
+                int x1 = to_crop_x(det.xmin);
+                int y1 = to_crop_y(det.ymin);
+                int w = det.xmax - det.xmin;
+                int h = det.ymax - det.ymin;
+                
+                if (x1 + w < 0 || x1 >= ALG_CROP_WIDTH || y1 + h < 0 || y1 >= ALG_CROP_HEIGHT) {
+                    continue;
+                }
+                
+                draw_rectangle(&crop_image_buf, x1, y1, w, h, COLOR_BLUE, 3);
                 
                 char text[64];
                 snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
-                draw_text(&src_image, text, det.xmin, det.ymin - 25, COLOR_RED, 12);
+                if (y1 - 25 > 0) {
+                    draw_text(&crop_image_buf, text, x1, y1 - 25, COLOR_RED, 12);
+                }
             }
             
             // 跟踪框（绿色）
             for (const auto& trk : track_results) {
-                draw_rectangle(&src_image, 
-                               trk.xmin, trk.ymin,
-                               trk.xmax - trk.xmin, trk.ymax - trk.ymin,
-                               COLOR_GREEN, 3);
+                int x1 = to_crop_x(trk.xmin);
+                int y1 = to_crop_y(trk.ymin);
+                int w = trk.xmax - trk.xmin;
+                int h = trk.ymax - trk.ymin;
                 
-                if (trk.is_predicted) {
-                    draw_text(&src_image, "[PRED]", trk.xmin, trk.ymin - 50, COLOR_YELLOW, 12);
+                if (x1 + w < 0 || x1 >= ALG_CROP_WIDTH || y1 + h < 0 || y1 >= ALG_CROP_HEIGHT) {
+                    continue;
+                }
+                
+                draw_rectangle(&crop_image_buf, x1, y1, w, h, COLOR_GREEN, 3);
+                
+                if (trk.is_predicted && y1 - 50 > 0) {
+                    draw_text(&crop_image_buf, "[PRED]", x1, y1 - 50, COLOR_YELLOW, 12);
                 }
             }
             
@@ -1979,7 +2004,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                      all_ball_detections.size(),
                      valid_ball_detections.size(),
                      excluded_detections.size());
-            draw_text(&src_image, debug_text1, 10, text_y, COLOR_YELLOW, font_size);
+            draw_text(&crop_image_buf, debug_text1, 10, text_y, COLOR_YELLOW, font_size);
             text_y += line_height;
             
             // 第二行：筛选和跟踪统计
@@ -1988,7 +2013,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                      ball_detections.size(),
                      ball_selector.get_frames_since_lost(),
                      tracker.HasActiveTrack() ? 1 : 0);
-            draw_text(&src_image, debug_text2, 10, text_y, COLOR_YELLOW, font_size);
+            draw_text(&crop_image_buf, debug_text2, 10, text_y, COLOR_YELLOW, font_size);
             text_y += line_height;
             
             // 第三行：黑名单和其他球场统计
@@ -1996,46 +2021,27 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             snprintf(debug_text3, sizeof(debug_text3), "Filter: Blacklist=%d OtherCourt=%d",
                      blacklist_count,
                      other_court_count);
-            draw_text(&src_image, debug_text3, 10, text_y, COLOR_PURPLE, font_size);
+            draw_text(&crop_image_buf, debug_text3, 10, text_y, COLOR_PURPLE, font_size);
             text_y += line_height;
             
-            // 第四行：裁剪框信息
+            // 第四行：裁剪框在全图中的位置
             char crop_info[128];
-            snprintf(crop_info, sizeof(crop_info), "Crop: [%d,%d]-[%d,%d] Center=(%.0f,%.0f)",
-                     crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom,
-                     crop_cx, crop_cy);
-            draw_text(&src_image, crop_info, 10, text_y, COLOR_RED, font_size);
+            snprintf(crop_info, sizeof(crop_info), "CropPos: [%d,%d]-[%d,%d]",
+                     crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom);
+            draw_text(&crop_image_buf, crop_info, 10, text_y, COLOR_RED, font_size);
             text_y += line_height;
             
-            // 第五行：区域信息
-            char region_info[128];
-            snprintf(region_info, sizeof(region_info), "Region: Valid=[0-%d] Exclude=[%d-%d]",
-                     EXCLUDE_RIGHT_START, EXCLUDE_RIGHT_START, PIC_FULL_WIDTH);
-            draw_text(&src_image, region_info, 10, text_y, COLOR_CYAN, font_size);
-            text_y += line_height;
-            
-            // 第六行：帧号
+            // 第五行：帧号
             char frame_info[64];
             snprintf(frame_info, sizeof(frame_info), "Frame: %d", frame_count);
-            draw_text(&src_image, frame_info, 10, text_y, COLOR_WHITE, font_size);
+            draw_text(&crop_image_buf, frame_info, 10, text_y, COLOR_WHITE, font_size);
         }
 
-        // ===== 更新运镜 =====
-        if (is_initialized && !track_results.empty()) {
-            auto &t = track_results[0];
-            camera.update_by_target(t.xmin, t.ymin, t.xmax, t.ymax);
-        }
-
-        // ===== 无目标时标记 =====
-        if (!found_ball) {
-            camera.mark_no_target();
-        }
-
-        // ===== 保存原图 =====
+        // ===== 保存裁切图 =====
         {
             char out_path[256];
             snprintf(out_path, sizeof(out_path), "%s/%06d.jpg", out_dir, frame_count);
-            write_image(out_path, &src_image);
+            write_image(out_path, &crop_image_buf);
         }
         
         frame_count++;
