@@ -173,12 +173,15 @@ public:
         last_target_cx_ = cx_;
         last_target_cy_ = cy_;
         
+        prev_target_vx_ = 0.0f;
+        prev_target_vy_ = 0.0f;
+        
         update_rect();
         
         printf("[Camera] Valid region: y=[%d, %d], height=%d\n", 
                valid_top_, valid_bottom_, valid_height_);
-        printf("[Camera] Tracking params: stiffness=%.3f, damping=%.2f, max_speed=%.1f, max_accel=%.1f\n",
-               stiffness_, damping_, max_speed_, max_accel_);
+        printf("[Camera] Tracking params: stiffness=%.3f, damping=%.2f, max_speed=%.1f\n",
+               stiffness_, damping_, max_speed_);
     }
 
     void update_position_only()
@@ -214,28 +217,30 @@ public:
         float new_target_cx = 0.5f * (xmin + xmax);
         float new_target_cy = 0.5f * (ymin + ymax);
         
-        // 计算目标速度（平滑处理）
         float instant_vx = new_target_cx - last_target_cx_;
         float instant_vy = new_target_cy - last_target_cy_;
+        
+        prev_target_vx_ = target_vx_;
+        prev_target_vy_ = target_vy_;
         
         target_vx_ = velocity_smooth_ * instant_vx + (1.0f - velocity_smooth_) * target_vx_;
         target_vy_ = velocity_smooth_ * instant_vy + (1.0f - velocity_smooth_) * target_vy_;
         
-        // 检测快速运动，动态调整预测帧数
-        float target_speed = std::sqrt(target_vx_ * target_vx_ + target_vy_ * target_vy_);
+        float prev_speed = std::sqrt(prev_target_vx_ * prev_target_vx_ + prev_target_vy_ * prev_target_vy_);
+        float curr_speed = std::sqrt(target_vx_ * target_vx_ + target_vy_ * target_vy_);
+        bool is_decelerating = (curr_speed < prev_speed * 0.8f);
+        
         float dynamic_prediction = prediction_frames_;
         
-        // 目标移动越快，预测越多
-        if (target_speed > 30.0f) {
-            dynamic_prediction = prediction_frames_ + 2.0f;  // 快速运动时增加预测
-        } else if (target_speed > 60.0f) {
-            dynamic_prediction = prediction_frames_ + 4.0f;  // 非常快时更多预测
+        if (is_decelerating || curr_speed < 10.0f) {
+            dynamic_prediction = prediction_frames_ * 0.3f;
+        } else if (curr_speed > 40.0f) {
+            dynamic_prediction = prediction_frames_ + 1.0f;
         }
         
-        last_target_cx_ = target_cx_;
-        last_target_cy_ = target_cy_;
+        last_target_cx_ = new_target_cx;
+        last_target_cy_ = new_target_cy;
         
-        // 使用动态预测
         target_cx_ = new_target_cx + target_vx_ * dynamic_prediction;
         target_cy_ = new_target_cy + target_vy_ * dynamic_prediction;
         
@@ -265,17 +270,18 @@ public:
                 crop_y >= 0 && crop_y < crop_h_);
     }
 
+    /**
+     * 标记没有目标 - 保持当前位置，不回中
+     */
     void mark_no_target()
     {
         frames_without_target_++;
         
-        if (frames_without_target_ > return_to_center_delay_) {
-            float center_x = img_w_ * 0.5f;
-            float center_y = valid_top_ + valid_height_ * 0.5f;
-            
-            target_cx_ = target_cx_ + (center_x - target_cx_) * return_to_center_speed_;
-            target_cy_ = target_cy_ + (center_y - target_cy_) * return_to_center_speed_;
-        }
+        // 丢失目标时，快速衰减目标速度
+        target_vx_ *= 0.7f;
+        target_vy_ *= 0.7f;
+        
+        // 不再回到中心，保持当前位置
     }
 
     void set_center(float cx, float cy)
@@ -298,6 +304,8 @@ public:
         target_vy_ = 0.0f;
         last_target_cx_ = cx;
         last_target_cy_ = cy;
+        prev_target_vx_ = 0.0f;
+        prev_target_vy_ = 0.0f;
         
         update_rect();
         
@@ -310,6 +318,7 @@ public:
     int get_crop_height() const { return crop_h_; }
     float get_center_x() const { return cx_; }
     float get_center_y() const { return cy_; }
+    int get_frames_without_target() const { return frames_without_target_; }
 
 private:
     int img_w_, img_h_;
@@ -327,34 +336,19 @@ private:
     float target_vx_, target_vy_;
     float last_target_cx_, last_target_cy_;
     
+    float prev_target_vx_, prev_target_vy_;
+    
     bool has_target_{false};
     int frames_without_target_{0};
 
-    // ================= 优化后的运镜参数 =================
-    // 弹簧刚度：增大以提高响应速度（原 0.02 → 0.05）
-    const float stiffness_ = 0.03f;
-    
-    // 阻尼系数：略微降低以提高灵活性（原 0.5 → 0.4）
-    const float damping_ = 0.4f;
-    
-    // 最大速度：大幅增加以跟上快速传球（原 20 → 50）
-    const float max_speed_ = 30.0f;
-    
-    // 最大加速度：增加以快速响应（原 1.5 → 4.0）
-    const float max_accel_ = 2.5f;
-    
-    // 死区比例：减小以提高灵敏度（原 0.20 → 0.12）
+    // ================= 运镜参数 =================
+    const float stiffness_ = 0.025f;
+    const float damping_ = 0.55f;
+    const float max_speed_ = 28.0f;
+    const float max_accel_ = 2.0f;
     const float dead_zone_ratio_ = 0.15f;
-    
-    // 预测帧数：增加以提前预判（原 2.0 → 4.0）
-    const float prediction_frames_ = 2.5f;
-    
-    // 速度平滑系数：增加以更快响应速度变化（原 0.25 → 0.35）
-    const float velocity_smooth_ = 0.25f;
-    
-    // 回中延迟和速度（保持不变）
-    const int return_to_center_delay_ = 60;
-    const float return_to_center_speed_ = 0.01f;
+    const float prediction_frames_ = 1.5f;
+    const float velocity_smooth_ = 0.2f;
 
 private:
     void update_camera_position()
@@ -365,21 +359,24 @@ private:
         float dead_zone_x = crop_w_ * dead_zone_ratio_;
         float dead_zone_y = crop_h_ * dead_zone_ratio_;
         
-        // 计算距离，用于动态调整响应
         float distance = std::sqrt(dx * dx + dy * dy);
         
-        if (std::fabs(dx) < dead_zone_x && std::fabs(dy) < dead_zone_y) {
-            // 在死区内，缓慢减速
-            vx_ *= (1.0f - damping_ * 0.5f);
-            vy_ *= (1.0f - damping_ * 0.5f);
+        float dot_product = vx_ * dx + vy_ * dy;
+        bool is_overshooting = (dot_product < 0) && (std::sqrt(vx_*vx_ + vy_*vy_) > 5.0f);
+        
+        if (is_overshooting) {
+            vx_ *= 0.6f;
+            vy_ *= 0.6f;
+        } else if (std::fabs(dx) < dead_zone_x && std::fabs(dy) < dead_zone_y) {
+            vx_ *= (1.0f - damping_ * 0.7f);
+            vy_ *= (1.0f - damping_ * 0.7f);
         } else {
-            // 动态刚度：距离越远，响应越强
             float dynamic_stiffness = stiffness_;
-            if (distance > 200.0f) {
-                dynamic_stiffness = stiffness_ * 1.5f;  // 距离远时增强响应
-            }
-            if (distance > 400.0f) {
-                dynamic_stiffness = stiffness_ * 2.0f;  // 距离很远时更强响应
+            
+            if (distance < 100.0f) {
+                dynamic_stiffness = stiffness_ * 0.6f;
+            } else if (distance > 300.0f) {
+                dynamic_stiffness = stiffness_ * 1.3f;
             }
             
             float fx = dynamic_stiffness * dx;
@@ -388,10 +385,11 @@ private:
             fx -= damping_ * vx_;
             fy -= damping_ * vy_;
             
-            // 动态最大加速度：距离远时允许更大加速度
             float dynamic_max_accel = max_accel_;
-            if (distance > 300.0f) {
-                dynamic_max_accel = max_accel_ * 1.5f;
+            if (distance < 150.0f) {
+                dynamic_max_accel = max_accel_ * 0.5f;
+            } else if (distance > 300.0f) {
+                dynamic_max_accel = max_accel_ * 1.3f;
             }
             
             float accel = std::sqrt(fx * fx + fy * fy);
@@ -405,17 +403,13 @@ private:
             vy_ += fy;
         }
         
-        // 动态最大速度：目标远时允许更快移动
-        float distance_to_target = std::sqrt(
-            (target_cx_ - cx_) * (target_cx_ - cx_) + 
-            (target_cy_ - cy_) * (target_cy_ - cy_));
-        
         float dynamic_max_speed = max_speed_;
-        if (distance_to_target > 200.0f) {
-            dynamic_max_speed = max_speed_ * 1.3f;
-        }
-        if (distance_to_target > 400.0f) {
-            dynamic_max_speed = max_speed_ * 1.6f;
+        if (distance < 100.0f) {
+            dynamic_max_speed = max_speed_ * 0.5f;
+        } else if (distance < 200.0f) {
+            dynamic_max_speed = max_speed_ * 0.7f;
+        } else if (distance > 400.0f) {
+            dynamic_max_speed = max_speed_ * 1.4f;
         }
         
         float speed = std::sqrt(vx_ * vx_ + vy_ * vy_);
@@ -515,6 +509,7 @@ private:
         }
     }
 };
+
 /*---------------------------------------------------*/
 // 阻塞式帧队列
 class FrameQueue {
@@ -1226,7 +1221,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     T_TrackObject last_track_result;
     bool has_last_track = false;
 
-    printf("[Consumer] === CROP OUTPUT MODE ===\n");
+    printf("[Consumer][DEBUG] === FULLFRAME OUTPUT MODE ===\n");
     printf("[Consumer] Image size: %dx%d, Crop size: %dx%d\n",
            PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
 
@@ -1258,31 +1253,89 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         float crop_cx = (crop_rect.left + crop_rect.right) / 2.0f;
         float crop_cy = (crop_rect.top + crop_rect.bottom) / 2.0f;
 
-        // 更新相机位置（不绘制红框到原图）
+        // 更新相机位置（不绘制）
         camera.update_position_only();
 
         // ===== 始终使用全图检测 =====
-        object_detect_result_list od_results;
-        inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
+        // object_detect_result_list od_results;
+        // inference_yolov8_model(&rknn_app_ctx, &src_image, &od_results);
         
-        for (int j = 0; j < od_results.count; j++) {
+        // for (int j = 0; j < od_results.count; j++) {
+        //     object_detect_result *det = &(od_results.results[j]);
+        //     char text[64];
+        //     snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
+            
+        //     if (strncmp(text, "ball", 4) == 0) {
+        //         T_DetectObject obj;
+        //         obj.cls_id = det->cls_id;
+        //         obj.score = det->prop;
+        //         obj.xmin = det->box.left;
+        //         obj.ymin = det->box.top;
+        //         obj.xmax = det->box.right;
+        //         obj.ymax = det->box.bottom;
+        //         all_ball_detections.push_back(obj);
+        //     }
+        // }
+        // ===== 使用有效区域检测（去掉顶部VALID_TOP区域）=====
+        image_buffer_t valid_region_image = {0};
+        bool need_free_valid_region = false;
+
+        // 裁剪有效区域
+        image_rect_t valid_box = {0, VALID_TOP, PIC_FULL_WIDTH, VALID_BOTTOM};
+        image_rect_t real_valid_rect;
+
+        int crop_ret = crop_alg_image(
+            &src_image,
+            &valid_region_image,
+            valid_box,
+            &real_valid_rect,
+            PIC_FULL_WIDTH,
+            VALID_BOTTOM - VALID_TOP);
+
+        if (crop_ret == 0)
+        {
+            need_free_valid_region = true;
+        }
+        else
+        {
+            printf("[Consumer][WARN] crop valid region failed (ret=%d), fallback to fullframe\n", crop_ret);
+            valid_region_image = src_image;
+        }
+
+        // YOLO检测
+        object_detect_result_list od_results;
+        inference_yolov8_model(&rknn_app_ctx, &valid_region_image, &od_results);
+
+        // 解析检测结果，坐标映射回全图
+        int y_offset = (crop_ret == 0) ? VALID_TOP : 0; // 成功裁剪时才需要偏移
+
+        for (int j = 0; j < od_results.count; j++)
+        {
             object_detect_result *det = &(od_results.results[j]);
             char text[64];
             snprintf(text, sizeof(text), "%s", coco_cls_to_name(det->cls_id));
-            
-            if (strncmp(text, "ball", 4) == 0) {
+
+            if (strncmp(text, "ball", 4) == 0)
+            {
                 T_DetectObject obj;
                 obj.cls_id = det->cls_id;
                 obj.score = det->prop;
                 obj.xmin = det->box.left;
-                obj.ymin = det->box.top;
+                obj.ymin = det->box.top + y_offset;
                 obj.xmax = det->box.right;
-                obj.ymax = det->box.bottom;
+                obj.ymax = det->box.bottom + y_offset;
                 all_ball_detections.push_back(obj);
             }
         }
-        
-        // 裁剪输出图
+
+        // 释放裁剪图像
+        if (need_free_valid_region && valid_region_image.virt_addr != nullptr)
+        {
+            free(valid_region_image.virt_addr);
+            valid_region_image.virt_addr = nullptr;
+        }
+
+        // 裁剪输出图（用于内部处理，但不输出）
         camera.crop_current_window(&src_image, &crop_image_buf);
 
         // 设置裁剪框中心偏好
@@ -1334,69 +1387,59 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             has_last_track = false;
         }
 
-        // ===== 在裁剪图上绘制 =====
-        if (crop_image_buf.virt_addr != NULL) {
-            // 选中的目标球（蓝色粗框）- 转换到裁剪图坐标
+        // ===== 在原图上绘制 =====
+        {
+            // 裁剪窗口（红色粗框）
+            draw_rectangle(&src_image, 
+                           crop_rect.left, crop_rect.top,
+                           crop_rect.right - crop_rect.left, 
+                           crop_rect.bottom - crop_rect.top,
+                           COLOR_RED, 4);
+
+            // 所有检测到的球（白色细框）
+            for (const auto& det : all_ball_detections) {
+                draw_rectangle(&src_image, 
+                               det.xmin, det.ymin,
+                               det.xmax - det.xmin, det.ymax - det.ymin,
+                               COLOR_WHITE, 1);
+            }
+
+            // 选中的目标球（蓝色粗框）
             for (const auto& det : ball_detections) {
-                int crop_x1 = det.xmin - crop_rect.left;
-                int crop_y1 = det.ymin - crop_rect.top;
-                int crop_x2 = det.xmax - crop_rect.left;
-                int crop_y2 = det.ymax - crop_rect.top;
+                draw_rectangle(&src_image, 
+                               det.xmin, det.ymin,
+                               det.xmax - det.xmin, det.ymax - det.ymin,
+                               COLOR_BLUE, 3);
                 
-                // 检查是否在裁剪图范围内
-                if (crop_x1 < ALG_CROP_WIDTH && crop_y1 < ALG_CROP_HEIGHT &&
-                    crop_x2 > 0 && crop_y2 > 0) {
-                    // 裁剪到有效范围
-                    crop_x1 = std::max(0, crop_x1);
-                    crop_y1 = std::max(0, crop_y1);
-                    crop_x2 = std::min(ALG_CROP_WIDTH, crop_x2);
-                    crop_y2 = std::min(ALG_CROP_HEIGHT, crop_y2);
-                    
-                    draw_rectangle(&crop_image_buf, 
-                                   crop_x1, crop_y1,
-                                   crop_x2 - crop_x1, crop_y2 - crop_y1,
-                                   COLOR_BLUE, 3);
-                    
-                    char text[64];
-                    snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
-                    if (crop_y1 > 25) {
-                        draw_text(&crop_image_buf, text, crop_x1, crop_y1 - 20, COLOR_RED, 10);
-                    }
-                }
+                char text[64];
+                snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
+                draw_text(&src_image, text, det.xmin, det.ymin - 20, COLOR_RED, 10);
             }
             
-            // 跟踪框（绿色）- 转换到裁剪图坐标
+            // 跟踪框（绿色）
             for (const auto& trk : track_results) {
-                int crop_x1 = trk.xmin - crop_rect.left;
-                int crop_y1 = trk.ymin - crop_rect.top;
-                int crop_x2 = trk.xmax - crop_rect.left;
-                int crop_y2 = trk.ymax - crop_rect.top;
+                draw_rectangle(&src_image, 
+                               trk.xmin, trk.ymin,
+                               trk.xmax - trk.xmin, trk.ymax - trk.ymin,
+                               COLOR_GREEN, 3);
                 
-                if (crop_x1 < ALG_CROP_WIDTH && crop_y1 < ALG_CROP_HEIGHT &&
-                    crop_x2 > 0 && crop_y2 > 0) {
-                    crop_x1 = std::max(0, crop_x1);
-                    crop_y1 = std::max(0, crop_y1);
-                    crop_x2 = std::min(ALG_CROP_WIDTH, crop_x2);
-                    crop_y2 = std::min(ALG_CROP_HEIGHT, crop_y2);
-                    
-                    draw_rectangle(&crop_image_buf, 
-                                   crop_x1, crop_y1,
-                                   crop_x2 - crop_x1, crop_y2 - crop_y1,
-                                   COLOR_GREEN, 3);
-                    
-                    if (trk.is_predicted && crop_y1 > 45) {
-                        draw_text(&crop_image_buf, "[PRED]", crop_x1, crop_y1 - 40, COLOR_YELLOW, 10);
-                    }
+                if (trk.is_predicted) {
+                    draw_text(&src_image, "[PRED]", trk.xmin, trk.ymin - 40, COLOR_YELLOW, 10);
                 }
             }
             
             // 调试信息
             char debug_text[128];
-            snprintf(debug_text, sizeof(debug_text), "Balls:%zu->%zu Lost:%d",
+            snprintf(debug_text, sizeof(debug_text), "[FULLFRAME] Balls:%zu->%zu Lost:%d",
                      all_ball_detections.size(),
                      ball_detections.size(),
                      ball_selector.get_frames_since_lost());
-            draw_text(&crop_image_buf, debug_text, 10, 25, COLOR_YELLOW, 12);
+            draw_text(&src_image, debug_text, 10, 30, COLOR_YELLOW, 15);
+            
+            char crop_info[64];
+            snprintf(crop_info, sizeof(crop_info), "Crop:[%d,%d]-[%d,%d]",
+                     crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom);
+            draw_text(&src_image, crop_info, 10, 60, COLOR_RED, 12);
         }
 
         // ===== 更新运镜 =====
@@ -1410,11 +1453,11 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             camera.mark_no_target();
         }
 
-        // ===== 保存裁剪图 =====
-        if (crop_image_buf.virt_addr != NULL) {
+        // ===== 保存原图 =====
+        {
             char out_path[256];
             snprintf(out_path, sizeof(out_path), "%s/%06d.jpg", out_dir, frame_count);
-            write_image(out_path, &crop_image_buf);
+            write_image(out_path, &src_image);
         }
         
         frame_count++;
