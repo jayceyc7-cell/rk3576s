@@ -25,6 +25,9 @@
 #include "awi_track.hpp"
 
 /*--------------------------------------*/
+#define COLOR_PURPLE  0xFF00FF  // 紫色/品红
+#define COLOR_GRAY 0x808080
+#define COLOR_CYAN  0x00FFFF  // 青色
 #define PIC_FULL_WIDTH 4608
 #define PIC_FULL_HEIGHT 1440
 // #define PIC_FULL_WIDTH 2560
@@ -638,8 +641,9 @@ void producer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *frames_d
 }
 
 /*------------------------------------------------*/
+/*------------------------------------------------*/
 /**
- * 球目标筛选器 - 增强版（支持区域限制）
+ * 球目标筛选器 - 增强版 V2（静止球黑名单 + 运动干扰球过滤）
  */
 class BallSelector {
 public:
@@ -651,7 +655,9 @@ public:
         bool is_static;
         int static_frames;
         bool ever_moved;
-        bool is_in_crop_region;      // 新增：是否在裁剪框内
+        bool is_in_crop_region;
+        bool is_blacklisted;         // 新增：是否在黑名单中
+        bool is_likely_other_court;  // 新增：是否可能是其他球场的球
         float priority_score;
     };
 
@@ -719,17 +725,35 @@ public:
             return nullptr;
         }
 
+        // 更新所有球的历史记录
         update_all_ball_history(detections);
+        
+        // 更新静止球黑名单
+        update_static_blacklist();
+        
+        // 更新其他球场干扰球追踪
+        update_other_court_balls();
 
         // 单个检测时也要严格检查
         if (detections.size() == 1) {
             const auto& det = detections[0];
+            
+            // 检查是否在黑名单中
+            if (is_in_static_blacklist(det)) {
+                handle_no_detection();
+                return nullptr;
+            }
+            
+            // 检查是否是其他球场的球
+            if (is_other_court_ball(det)) {
+                handle_no_detection();
+                return nullptr;
+            }
+            
             if (is_in_valid_region(det) && is_acceptable_target(det)) {
-                // 额外检查：如果之前有目标且是运动的，新目标不能是静止的
                 if (target_was_moving_ && frames_since_target_lost_ < strict_protection_frames_) {
                     BallHistory* hist = find_ball_history(det);
                     if (hist != nullptr && !hist->ever_moved && hist->static_count > 5) {
-                        // 拒绝静止球
                         handle_no_detection();
                         return nullptr;
                     }
@@ -753,10 +777,28 @@ public:
             candidate.static_frames = 0;
             candidate.ever_moved = false;
             candidate.is_in_crop_region = false;
+            candidate.is_blacklisted = false;
+            candidate.is_likely_other_court = false;
             candidate.priority_score = 0.0f;
 
             if (!is_in_valid_region(det)) {
                 continue;
+            }
+
+            // ===== 黑名单检查（静止干扰球）=====
+            if (is_in_static_blacklist(det)) {
+                candidate.is_blacklisted = true;
+                // 黑名单中的球直接跳过，不作为候选
+                continue;
+            }
+            
+            // ===== 其他球场干扰球检查 =====
+            if (is_other_court_ball(det)) {
+                candidate.is_likely_other_court = true;
+                // 如果已经有稳定跟踪目标，直接跳过其他球场的球
+                if (has_locked_target_ && consecutive_track_frames_ > 10) {
+                    continue;
+                }
             }
 
             // 检查是否在裁剪框内
@@ -773,12 +815,10 @@ public:
             }
 
             // ===== 严格的静止球过滤 =====
-            // 条件1：从未运动过且静止时间长
             if (!candidate.ever_moved && candidate.static_frames > never_moved_threshold_) {
                 continue;
             }
             
-            // 条件2：如果之前跟踪的是运动球，且目标刚丢失不久，拒绝所有静止球
             if (target_was_moving_ && 
                 frames_since_target_lost_ < strict_protection_frames_ &&
                 candidate.is_static && 
@@ -786,7 +826,6 @@ public:
                 continue;
             }
 
-            // 条件3：不在裁剪框内的静止球，直接跳过
             if (!candidate.is_in_crop_region && 
                 candidate.is_static && 
                 candidate.static_frames > 10) {
@@ -800,10 +839,9 @@ public:
             if (has_locked_target_) {
                 candidate.distance_to_last_target = calculate_distance_to_last_target(det);
                 
-                // 如果距离上一个目标位置太远，且目标刚丢失不久，大幅降低优先级
                 if (candidate.distance_to_last_target > target_switch_threshold_ && 
                     frames_since_target_lost_ < target_search_grace_period_) {
-                    candidate.priority_score -= 800.0f;  // 加大惩罚
+                    candidate.priority_score -= 800.0f;
                 }
             }
 
@@ -824,18 +862,14 @@ public:
 
         const auto& best = candidates[0];
         
-        // 更严格的接受条件
         if (best.priority_score < min_accept_score_) {
-            // 如果有锁定目标且刚丢失，拒绝低分候选
             if (has_locked_target_ && frames_since_target_lost_ < strict_protection_frames_) {
                 handle_no_detection();
                 return nullptr;
             }
         }
 
-        // 额外检查：如果最佳候选是静止球且不在裁剪框内，拒绝
         if (best.is_static && !best.is_in_crop_region && !best.ever_moved) {
-            // 只有在已经丢失很久后才接受
             if (frames_since_target_lost_ < extended_search_frames_) {
                 handle_no_detection();
                 return nullptr;
@@ -845,11 +879,14 @@ public:
         for (const auto& det : detections) {
             if (det.xmin == best.det.xmin && det.ymin == best.det.ymin) {
                 update_locked_target(det);
-                // 记录目标是否在运动
                 BallHistory* hist = find_ball_history(det);
                 if (hist != nullptr && hist->ever_moved) {
                     target_was_moving_ = true;
                 }
+                
+                // 标记该球为主目标，用于区分其他球场的球
+                mark_as_main_target(det);
+                
                 return &det;
             }
         }
@@ -867,6 +904,8 @@ public:
     void reset()
     {
         ball_history_.clear();
+        static_blacklist_.clear();
+        other_court_balls_.clear();
         has_locked_target_ = false;
         frames_since_target_lost_ = 0;
         last_target_cx_ = 0;
@@ -877,10 +916,66 @@ public:
         use_crop_center_bias_ = false;
         target_was_moving_ = false;
         consecutive_track_frames_ = 0;
+        main_target_id_ = -1;
+    }
+    
+    /**
+     * 手动添加静止球黑名单区域
+     */
+    void add_static_blacklist_zone(float cx, float cy, float radius = 50.0f)
+    {
+        StaticBlacklistEntry entry;
+        entry.cx = cx;
+        entry.cy = cy;
+        entry.radius = radius;
+        entry.added_frame = current_frame_;
+        entry.last_seen_frame = current_frame_;
+        entry.confidence = 1.0f;
+        static_blacklist_.push_back(entry);
+        printf("[BallSelector] Manual blacklist added at (%.0f, %.0f)\n", cx, cy);
+    }
+    
+    /**
+     * 清除所有黑名单
+     */
+    void clear_blacklist()
+    {
+        static_blacklist_.clear();
+        other_court_balls_.clear();
+        printf("[BallSelector] All blacklists cleared\n");
+    }
+    
+    /**
+     * 获取调试信息
+     */
+    void get_debug_info(int& blacklist_count, int& other_court_count) const
+    {
+        blacklist_count = static_cast<int>(static_blacklist_.size());
+        other_court_count = static_cast<int>(other_court_balls_.size());
     }
 
     bool has_locked_target() const { return has_locked_target_; }
     int get_frames_since_lost() const { return frames_since_target_lost_; }
+    
+    // 获取黑名单列表（用于调试绘制）
+    const std::vector<std::pair<float, float>> get_blacklist_positions() const
+    {
+        std::vector<std::pair<float, float>> positions;
+        for (const auto& entry : static_blacklist_) {
+            positions.push_back({entry.cx, entry.cy});
+        }
+        return positions;
+    }
+    
+    // 获取其他球场球列表（用于调试绘制）
+    const std::vector<std::pair<float, float>> get_other_court_positions() const
+    {
+        std::vector<std::pair<float, float>> positions;
+        for (const auto& ball : other_court_balls_) {
+            positions.push_back({ball.cx, ball.cy});
+        }
+        return positions;
+    }
 
 private:
     int valid_left_;
@@ -888,17 +983,30 @@ private:
     int valid_top_;
     int valid_bottom_;
 
-    // ===== 参数配置（调整后）=====
-    static constexpr int static_threshold_ = 20;           // 静止判定阈值（降低，更快判定为静止）
-    static constexpr int never_moved_threshold_ = 45;      // 从未运动阈值（降低）
-    static constexpr float static_move_threshold_ = 12.0f; // 静止移动阈值（降低，更严格）
-    static constexpr float move_detection_threshold_ = 30.0f; // 运动检测阈值
-    static constexpr float target_switch_threshold_ = 250.0f; // 目标切换距离阈值（降低）
-    static constexpr int target_search_grace_period_ = 15;    // 目标丢失宽限期（增加）
-    static constexpr int strict_protection_frames_ = 25;      // 严格保护期（新增）
-    static constexpr int extended_search_frames_ = 40;        // 扩展搜索帧数（新增）
-    static constexpr float min_accept_score_ = -50.0f;        // 最低可接受分数（提高）
+    // ===== 参数配置 =====
+    static constexpr int static_threshold_ = 20;
+    static constexpr int never_moved_threshold_ = 45;
+    static constexpr float static_move_threshold_ = 12.0f;
+    static constexpr float move_detection_threshold_ = 30.0f;
+    static constexpr float target_switch_threshold_ = 250.0f;
+    static constexpr int target_search_grace_period_ = 15;
+    static constexpr int strict_protection_frames_ = 25;
+    static constexpr int extended_search_frames_ = 40;
+    static constexpr float min_accept_score_ = -50.0f;
+    
+    // ===== 黑名单参数 =====
+    static constexpr int blacklist_static_threshold_ = 60;      // 静止多少帧后加入黑名单
+    static constexpr float blacklist_match_radius_ = 60.0f;     // 黑名单匹配半径
+    static constexpr int blacklist_expire_frames_ = 900;        // 黑名单过期帧数（30秒@30fps）
+    static constexpr float blacklist_reconfirm_radius_ = 40.0f; // 重新确认半径
+    
+    // ===== 其他球场干扰球参数 =====
+    static constexpr float other_court_distance_threshold_ = 400.0f;  // 距离主目标多远认为是其他球场
+    static constexpr int other_court_confirm_frames_ = 30;            // 确认为其他球场球的帧数
+    static constexpr float other_court_direction_threshold_ = 0.7f;   // 方向相反阈值（cos值）
+    static constexpr int other_court_expire_frames_ = 300;            // 其他球场球过期帧数
 
+    // ===== 球历史记录 =====
     struct BallHistory {
         float cx, cy;
         float initial_cx, initial_cy;
@@ -908,24 +1016,292 @@ private:
         int first_seen_frame;
         bool is_static;
         bool ever_moved;
+        int id;  // 用于追踪同一个球
+        
+        // 运动方向历史
+        float avg_vx, avg_vy;
+        int velocity_samples;
     };
     std::vector<BallHistory> ball_history_;
     int current_frame_;
+    int next_ball_id_ = 0;
+    int main_target_id_ = -1;  // 主目标球的ID
+
+    // ===== 静止球黑名单 =====
+    struct StaticBlacklistEntry {
+        float cx, cy;
+        float radius;
+        int added_frame;
+        int last_seen_frame;
+        float confidence;  // 置信度，多次确认会增加
+    };
+    std::vector<StaticBlacklistEntry> static_blacklist_;
+    
+    // ===== 其他球场干扰球追踪 =====
+    struct OtherCourtBall {
+        float cx, cy;
+        float vx, vy;           // 平均速度
+        int first_seen_frame;
+        int last_seen_frame;
+        int confirm_count;      // 确认次数
+        bool is_confirmed;      // 是否已确认为其他球场的球
+        int id;
+    };
+    std::vector<OtherCourtBall> other_court_balls_;
 
     bool has_locked_target_;
     int frames_since_target_lost_;
     float last_target_cx_, last_target_cy_;
     float last_target_vx_, last_target_vy_;
 
-    // 裁剪框信息
     float crop_center_x_, crop_center_y_;
     float crop_half_w_, crop_half_h_;
     bool use_crop_center_bias_;
     
-    // 目标运动状态
     bool target_was_moving_;
     int consecutive_track_frames_;
 
+    // ==================== 静止球黑名单相关 ====================
+    
+    /**
+     * 更新静止球黑名单
+     */
+    void update_static_blacklist()
+    {
+        // 1. 清理过期的黑名单条目
+        static_blacklist_.erase(
+            std::remove_if(static_blacklist_.begin(), static_blacklist_.end(),
+                [this](const StaticBlacklistEntry& entry) {
+                    return (current_frame_ - entry.last_seen_frame) > blacklist_expire_frames_;
+                }),
+            static_blacklist_.end());
+        
+        // 2. 检查球历史，将长期静止的球加入黑名单
+        for (const auto& hist : ball_history_) {
+            // 条件：从未运动过 且 静止帧数超过阈值
+            if (!hist.ever_moved && hist.static_count > blacklist_static_threshold_) {
+                // 检查是否已在黑名单中
+                bool already_blacklisted = false;
+                for (auto& entry : static_blacklist_) {
+                    float dist = std::sqrt((hist.cx - entry.cx) * (hist.cx - entry.cx) + 
+                                           (hist.cy - entry.cy) * (hist.cy - entry.cy));
+                    if (dist < blacklist_reconfirm_radius_) {
+                        // 已在黑名单中，增加置信度
+                        entry.confidence = std::min(entry.confidence + 0.1f, 2.0f);
+                        entry.last_seen_frame = current_frame_;
+                        already_blacklisted = true;
+                        break;
+                    }
+                }
+                
+                if (!already_blacklisted && static_blacklist_.size() < 20) {
+                    StaticBlacklistEntry new_entry;
+                    new_entry.cx = hist.cx;
+                    new_entry.cy = hist.cy;
+                    new_entry.radius = blacklist_match_radius_;
+                    new_entry.added_frame = current_frame_;
+                    new_entry.last_seen_frame = current_frame_;
+                    new_entry.confidence = 1.0f;
+                    static_blacklist_.push_back(new_entry);
+                    
+                    printf("[BallSelector][Frame %d] Static ball blacklisted at (%.0f, %.0f)\n",
+                           current_frame_, hist.cx, hist.cy);
+                }
+            }
+        }
+    }
+    
+    /**
+     * 检查检测结果是否在静止球黑名单中
+     */
+    bool is_in_static_blacklist(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        for (auto& entry : static_blacklist_) {
+            float dist = std::sqrt((cx - entry.cx) * (cx - entry.cx) + 
+                                   (cy - entry.cy) * (cy - entry.cy));
+            
+            // 使用动态半径：置信度越高，匹配半径越大
+            float effective_radius = entry.radius * entry.confidence;
+            
+            if (dist < effective_radius) {
+                // 更新最后看到时间
+                entry.last_seen_frame = current_frame_;
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    // ==================== 其他球场干扰球相关 ====================
+    
+    /**
+     * 更新其他球场干扰球追踪
+     */
+    void update_other_court_balls()
+    {
+        // 清理过期的其他球场球记录
+        other_court_balls_.erase(
+            std::remove_if(other_court_balls_.begin(), other_court_balls_.end(),
+                [this](const OtherCourtBall& ball) {
+                    return (current_frame_ - ball.last_seen_frame) > other_court_expire_frames_;
+                }),
+            other_court_balls_.end());
+        
+        // 如果没有主目标，无法判断其他球场
+        if (!has_locked_target_ || consecutive_track_frames_ < 5) {
+            return;
+        }
+        
+        // 检查球历史中是否有符合其他球场特征的球
+        for (const auto& hist : ball_history_) {
+            // 跳过主目标
+            if (hist.id == main_target_id_) {
+                continue;
+            }
+            
+            // 条件1：距离主目标足够远
+            float dist_to_target = std::sqrt(
+                (hist.cx - last_target_cx_) * (hist.cx - last_target_cx_) + 
+                (hist.cy - last_target_cy_) * (hist.cy - last_target_cy_));
+            
+            if (dist_to_target < other_court_distance_threshold_) {
+                continue;
+            }
+            
+            // 条件2：球在运动（不是静止的）
+            if (!hist.ever_moved) {
+                continue;
+            }
+            
+            // 条件3：运动方向与主目标不同或相反
+            bool direction_mismatch = false;
+            if (hist.velocity_samples > 5 && 
+                (std::fabs(last_target_vx_) > 5.0f || std::fabs(last_target_vy_) > 5.0f)) {
+                
+                float target_speed = std::sqrt(last_target_vx_ * last_target_vx_ + 
+                                               last_target_vy_ * last_target_vy_);
+                float hist_speed = std::sqrt(hist.avg_vx * hist.avg_vx + 
+                                             hist.avg_vy * hist.avg_vy);
+                
+                if (target_speed > 5.0f && hist_speed > 5.0f) {
+                    // 计算方向余弦
+                    float dot = (last_target_vx_ * hist.avg_vx + last_target_vy_ * hist.avg_vy) / 
+                                (target_speed * hist_speed);
+                    
+                    // 方向相反或垂直
+                    if (dot < other_court_direction_threshold_) {
+                        direction_mismatch = true;
+                    }
+                }
+            }
+            
+            // 满足距离条件，检查是否已在追踪列表中
+            OtherCourtBall* existing = nullptr;
+            for (auto& ball : other_court_balls_) {
+                float d = std::sqrt((hist.cx - ball.cx) * (hist.cx - ball.cx) + 
+                                    (hist.cy - ball.cy) * (hist.cy - ball.cy));
+                if (d < 100.0f) {
+                    existing = &ball;
+                    break;
+                }
+            }
+            
+            if (existing != nullptr) {
+                // 更新现有记录
+                existing->cx = hist.cx;
+                existing->cy = hist.cy;
+                existing->vx = hist.avg_vx;
+                existing->vy = hist.avg_vy;
+                existing->last_seen_frame = current_frame_;
+                
+                if (direction_mismatch) {
+                    existing->confirm_count++;
+                }
+                
+                // 确认阈值
+                if (existing->confirm_count > other_court_confirm_frames_ && !existing->is_confirmed) {
+                    existing->is_confirmed = true;
+                    printf("[BallSelector][Frame %d] Other court ball confirmed at (%.0f, %.0f)\n",
+                           current_frame_, existing->cx, existing->cy);
+                }
+            } else if (direction_mismatch && other_court_balls_.size() < 10) {
+                // 新增追踪
+                OtherCourtBall new_ball;
+                new_ball.cx = hist.cx;
+                new_ball.cy = hist.cy;
+                new_ball.vx = hist.avg_vx;
+                new_ball.vy = hist.avg_vy;
+                new_ball.first_seen_frame = current_frame_;
+                new_ball.last_seen_frame = current_frame_;
+                new_ball.confirm_count = 1;
+                new_ball.is_confirmed = false;
+                new_ball.id = hist.id;
+                other_court_balls_.push_back(new_ball);
+            }
+        }
+    }
+    
+    /**
+     * 检查是否是其他球场的球
+     */
+    bool is_other_court_ball(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        for (const auto& ball : other_court_balls_) {
+            if (!ball.is_confirmed) {
+                continue;
+            }
+            
+            float dist = std::sqrt((cx - ball.cx) * (cx - ball.cx) + 
+                                   (cy - ball.cy) * (cy - ball.cy));
+            
+            // 考虑运动预测
+            float predicted_cx = ball.cx + ball.vx * (current_frame_ - ball.last_seen_frame);
+            float predicted_cy = ball.cy + ball.vy * (current_frame_ - ball.last_seen_frame);
+            float dist_predicted = std::sqrt((cx - predicted_cx) * (cx - predicted_cx) + 
+                                             (cy - predicted_cy) * (cy - predicted_cy));
+            
+            if (dist < 80.0f || dist_predicted < 120.0f) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    /**
+     * 标记检测为主目标
+     */
+    void mark_as_main_target(const T_DetectObject& det)
+    {
+        float cx = (det.xmin + det.xmax) / 2.0f;
+        float cy = (det.ymin + det.ymax) / 2.0f;
+        
+        for (auto& hist : ball_history_) {
+            float dist = std::sqrt((cx - hist.cx) * (cx - hist.cx) + 
+                                   (cy - hist.cy) * (cy - hist.cy));
+            if (dist < 30.0f) {
+                main_target_id_ = hist.id;
+                
+                // 如果这个球之前被误判为其他球场球，移除
+                other_court_balls_.erase(
+                    std::remove_if(other_court_balls_.begin(), other_court_balls_.end(),
+                        [&hist](const OtherCourtBall& ball) {
+                            return ball.id == hist.id;
+                        }),
+                    other_court_balls_.end());
+                
+                return;
+            }
+        }
+    }
+
+    // ==================== 原有方法 ====================
+    
     bool is_in_valid_region(const T_DetectObject& det)
     {
         float cx = (det.xmin + det.xmax) / 2.0f;
@@ -935,9 +1311,6 @@ private:
                 cy >= valid_top_ && cy <= valid_bottom_);
     }
 
-    /**
-     * 检查球是否在裁剪框区域内
-     */
     bool is_in_crop_region(const T_DetectObject& det)
     {
         float cx = (det.xmin + det.xmax) / 2.0f;
@@ -984,6 +1357,16 @@ private:
                 float move_dist = std::sqrt((cx - hist->cx) * (cx - hist->cx) + 
                                             (cy - hist->cy) * (cy - hist->cy));
                 
+                // 计算瞬时速度
+                float inst_vx = cx - hist->cx;
+                float inst_vy = cy - hist->cy;
+                
+                // 更新平均速度（指数移动平均）
+                const float velocity_alpha = 0.3f;
+                hist->avg_vx = velocity_alpha * inst_vx + (1.0f - velocity_alpha) * hist->avg_vx;
+                hist->avg_vy = velocity_alpha * inst_vy + (1.0f - velocity_alpha) * hist->avg_vy;
+                hist->velocity_samples++;
+                
                 hist->total_movement += move_dist;
                 
                 float dist_from_initial = std::sqrt(
@@ -996,7 +1379,7 @@ private:
                 
                 if (move_dist < static_move_threshold_) {
                     hist->static_count++;
-                    hist->is_static = (hist->static_count > 3);  // 更快判定为静止
+                    hist->is_static = (hist->static_count > 3);
                 } else {
                     hist->static_count = 0;
                     hist->is_static = false;
@@ -1018,6 +1401,10 @@ private:
                     new_hist.first_seen_frame = current_frame_;
                     new_hist.is_static = false;
                     new_hist.ever_moved = false;
+                    new_hist.id = next_ball_id_++;
+                    new_hist.avg_vx = 0.0f;
+                    new_hist.avg_vy = 0.0f;
+                    new_hist.velocity_samples = 0;
                     ball_history_.push_back(new_hist);
                 }
             }
@@ -1032,7 +1419,6 @@ private:
             return true;
         }
         
-        // 从未运动过且已经出现很久
         if (!hist->ever_moved && 
             (current_frame_ - hist->first_seen_frame) > never_moved_threshold_) {
             return false;
@@ -1063,15 +1449,12 @@ private:
         if (has_locked_target_) {
             frames_since_target_lost_++;
             
-            // 预测目标位置
             last_target_cx_ += last_target_vx_;
             last_target_cy_ += last_target_vy_;
             
-            // 速度衰减
             last_target_vx_ *= 0.85f;
             last_target_vy_ *= 0.85f;
             
-            // 丢失太久后重置运动状态
             if (frames_since_target_lost_ > extended_search_frames_) {
                 target_was_moving_ = false;
             }
@@ -1122,43 +1505,41 @@ private:
             }
         }
 
-        // 3. 运动历史奖励（大幅增加）
+        // 3. 运动历史奖励
         if (candidate.ever_moved) {
-            score += 350.0f;  // 增加运动球的优势
+            score += 350.0f;
         }
 
-        // 4. 静止惩罚（加重）
+        // 4. 静止惩罚
         if (candidate.is_static) {
-            score -= candidate.static_frames * 5.0f;  // 加重惩罚
+            score -= candidate.static_frames * 5.0f;
         }
 
-        // 5. 从未运动过的球额外惩罚（加重）
+        // 5. 从未运动过的球额外惩罚
         if (!candidate.ever_moved) {
             if (candidate.static_frames > 5) {
-                score -= 400.0f;  // 大幅降分
+                score -= 400.0f;
             }
             if (candidate.static_frames > 15) {
-                score -= 300.0f;  // 继续降分
+                score -= 300.0f;
             }
         }
 
-        // 6. 与上次目标位置的距离（目标连续性）
+        // 6. 与上次目标位置的距离
         if (has_locked_target_ && candidate.distance_to_last_target < 1e8f) {
             if (candidate.distance_to_last_target < 150.0f) {
-                score += (150.0f - candidate.distance_to_last_target) * 2.0f;  // 增加权重
+                score += (150.0f - candidate.distance_to_last_target) * 2.0f;
             }
-            // 距离远的惩罚
             if (candidate.distance_to_last_target > 300.0f) {
                 score -= (candidate.distance_to_last_target - 300.0f) * 0.5f;
             }
         }
 
-        // 7. 裁剪框内优先（大幅增加权重）
+        // 7. 裁剪框内优先
         if (use_crop_center_bias_) {
             if (candidate.is_in_crop_region) {
-                score += 300.0f;  // 裁剪框内的球大幅加分
+                score += 300.0f;
             } else {
-                // 裁剪框外的球降分，距离越远降得越多
                 if (candidate.distance_to_crop_center > 400.0f) {
                     score -= 150.0f;
                 }
@@ -1169,6 +1550,11 @@ private:
                     score -= 350.0f;
                 }
             }
+        }
+        
+        // 8. 新增：疑似其他球场的球降分
+        if (candidate.is_likely_other_court) {
+            score -= 500.0f;
         }
 
         return score;
@@ -1209,8 +1595,11 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         VALID_BOTTOM
     );
 
-    // 球筛选器
-    BallSelector ball_selector(0, PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
+    // 右侧排除区域边界（4608 - 408 = 4200）
+    const int EXCLUDE_RIGHT_START = PIC_FULL_WIDTH - 408;
+    
+    // 球筛选器 - 有效区域设为排除右侧后的范围
+    BallSelector ball_selector(0, EXCLUDE_RIGHT_START, VALID_TOP, VALID_BOTTOM);
 
     // 初始化状态
     bool is_initialized = false;
@@ -1221,15 +1610,19 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
     T_TrackObject last_track_result;
     bool has_last_track = false;
 
-    // 分区检测参数
+    // 分区检测参数（仍然使用全宽4608进行检测）
     const int VALID_HEIGHT = VALID_BOTTOM - VALID_TOP;
-    const int HALF_WIDTH = PIC_FULL_WIDTH / 2;  // 720
+    const int HALF_WIDTH = PIC_FULL_WIDTH / 2;  // 2304
 
-    printf("[Consumer][DEBUG] === SPLIT DETECTION MODE ===\n");
+    printf("[Consumer][DEBUG] === SPLIT DETECTION MODE (WITH RIGHT EXCLUSION) ===\n");
     printf("[Consumer] Image size: %dx%d, Crop size: %dx%d\n",
            PIC_FULL_WIDTH, PIC_FULL_HEIGHT, ALG_CROP_WIDTH, ALG_CROP_HEIGHT);
-    printf("[Consumer] Detection regions: Left[0-%d], Right[%d-%d], Height[%d-%d]\n",
-           HALF_WIDTH, HALF_WIDTH, PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
+    printf("[Consumer] Detection region: [0-%d] x [%d-%d]\n",
+           PIC_FULL_WIDTH, VALID_TOP, VALID_BOTTOM);
+    printf("[Consumer] Exclusion zone: x >= %d (right %d pixels)\n",
+           EXCLUDE_RIGHT_START, PIC_FULL_WIDTH - EXCLUDE_RIGHT_START);
+    printf("[Consumer] Split regions: Left[0-%d], Right[%d-%d]\n",
+           HALF_WIDTH, HALF_WIDTH, PIC_FULL_WIDTH);
 
     while (true) {
         frame_track_count++;
@@ -1250,7 +1643,9 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
 
         bool found_ball = false;
         
-        std::vector<T_DetectObject> all_ball_detections;
+        std::vector<T_DetectObject> all_ball_detections;      // 所有检测结果（含排除区域）
+        std::vector<T_DetectObject> valid_ball_detections;    // 过滤后的有效检测
+        std::vector<T_DetectObject> excluded_detections;      // 被排除的检测（用于调试显示）
         std::vector<T_DetectObject> ball_detections;
         std::vector<T_TrackObject> track_results;
 
@@ -1262,9 +1657,9 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         // 更新相机位置（不绘制）
         camera.update_position_only();
 
-        // ===== 左右分区检测（减少误检）=====
+        // ===== 左右分区检测（完整4608x860区域）=====
         
-        // 左半区域检测
+        // 左半区域检测 [0, VALID_TOP] - [2304, VALID_BOTTOM]
         {
             image_buffer_t left_region_image = {0};
             image_rect_t left_box = {0, VALID_TOP, HALF_WIDTH, VALID_BOTTOM};
@@ -1309,7 +1704,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             }
         }
 
-        // 右半区域检测
+        // 右半区域检测 [2304, VALID_TOP] - [4608, VALID_BOTTOM]
         {
             image_buffer_t right_region_image = {0};
             image_rect_t right_box = {HALF_WIDTH, VALID_TOP, PIC_FULL_WIDTH, VALID_BOTTOM};
@@ -1368,10 +1763,8 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                     float dist = std::sqrt((det_cx - ex_cx) * (det_cx - ex_cx) + 
                                            (det_cy - ex_cy) * (det_cy - ex_cy));
                     
-                    // 距离小于50像素认为是重复检测，保留置信度高的
                     if (dist < 50.0f) {
                         is_duplicate = true;
-                        // 如果当前检测置信度更高，替换已有的
                         if (det.score > existing.score) {
                             for (auto& e : deduped) {
                                 if (&e == &existing) {
@@ -1391,16 +1784,27 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             all_ball_detections = std::move(deduped);
         }
 
+        // ===== 过滤右侧排除区域的检测结果 =====
+        for (const auto& det : all_ball_detections) {
+            float det_cx = (det.xmin + det.xmax) / 2.0f;
+            
+            if (det_cx >= EXCLUDE_RIGHT_START) {
+                excluded_detections.push_back(det);
+            } else {
+                valid_ball_detections.push_back(det);
+            }
+        }
+
         // 裁剪输出图（用于内部处理，但不输出）
         camera.crop_current_window(&src_image, &crop_image_buf);
 
         // 设置裁剪框中心偏好
         ball_selector.set_crop_center(crop_cx, crop_cy);
 
-        // ===== 球筛选 =====
-        if (!all_ball_detections.empty()) {
+        // ===== 球筛选（只使用有效检测结果）=====
+        if (!valid_ball_detections.empty()) {
             const T_DetectObject *target = ball_selector.select_target_ball(
-                all_ball_detections,
+                valid_ball_detections,
                 has_last_track ? &last_track_result : nullptr,
                 has_last_track);
 
@@ -1443,13 +1847,78 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
             has_last_track = false;
         }
 
+        // ===== 获取黑名单和其他球场球信息 =====
+        int blacklist_count = 0;
+        int other_court_count = 0;
+        ball_selector.get_debug_info(blacklist_count, other_court_count);
+        
+        auto blacklist_positions = ball_selector.get_blacklist_positions();
+        auto other_court_positions = ball_selector.get_other_court_positions();
+
         // ===== 在原图上绘制 =====
         {
-            // 绘制左右分区线（黄色虚线效果用实线代替）
+            // 绘制右侧排除区域（灰色框）
+            draw_rectangle(&src_image, 
+                           EXCLUDE_RIGHT_START, VALID_TOP,
+                           PIC_FULL_WIDTH - EXCLUDE_RIGHT_START, VALID_HEIGHT,
+                           COLOR_GRAY, 3);
+            
+            // 绘制左右分区线（黄色）
             draw_rectangle(&src_image, 
                            HALF_WIDTH - 1, VALID_TOP,
                            2, VALID_HEIGHT,
                            COLOR_YELLOW, 1);
+
+            // ===== 绘制黑名单位置（紫色/品红色 圆圈 + X标记）=====
+            for (const auto& pos : blacklist_positions) {
+                int cx = static_cast<int>(pos.first);
+                int cy = static_cast<int>(pos.second);
+                int radius = 45;
+                
+                // 画圆圈
+                draw_rectangle(&src_image,
+                               cx - radius, cy - radius,
+                               radius * 2, radius * 2,
+                               COLOR_PURPLE, 3);
+                
+                // 画X标记
+                // 左上到右下
+                for (int i = -radius + 5; i < radius - 5; i++) {
+                    int px = cx + i;
+                    int py = cy + i;
+                    if (px >= 0 && px < PIC_FULL_WIDTH && py >= 0 && py < PIC_FULL_HEIGHT) {
+                        // 简单的点绘制（如果有draw_line可以用draw_line）
+                        draw_rectangle(&src_image, px, py, 3, 3, COLOR_PURPLE, 1);
+                    }
+                }
+                // 右上到左下
+                for (int i = -radius + 5; i < radius - 5; i++) {
+                    int px = cx + i;
+                    int py = cy - i;
+                    if (px >= 0 && px < PIC_FULL_WIDTH && py >= 0 && py < PIC_FULL_HEIGHT) {
+                        draw_rectangle(&src_image, px, py, 3, 3, COLOR_PURPLE, 1);
+                    }
+                }
+                
+                // 标签
+                draw_text(&src_image, "[BLACKLIST]", cx - 40, cy - radius - 25, COLOR_PURPLE, 12);
+            }
+
+            // ===== 绘制其他球场的球（橙色 圆圈）=====
+            for (const auto& pos : other_court_positions) {
+                int cx = static_cast<int>(pos.first);
+                int cy = static_cast<int>(pos.second);
+                int radius = 40;
+                
+                // 画圆圈（用矩形框近似）
+                draw_rectangle(&src_image,
+                               cx - radius, cy - radius,
+                               radius * 2, radius * 2,
+                               COLOR_ORANGE, 3);
+                
+                // 标签
+                draw_text(&src_image, "[OTHER COURT]", cx - 50, cy - radius - 25, COLOR_ORANGE, 12);
+            }
 
             // 裁剪窗口（红色粗框）
             draw_rectangle(&src_image, 
@@ -1458,8 +1927,17 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                            crop_rect.bottom - crop_rect.top,
                            COLOR_RED, 4);
 
-            // 所有检测到的球（白色细框）
-            for (const auto& det : all_ball_detections) {
+            // 被排除的检测（灰色细框 + 标记）
+            for (const auto& det : excluded_detections) {
+                draw_rectangle(&src_image, 
+                               det.xmin, det.ymin,
+                               det.xmax - det.xmin, det.ymax - det.ymin,
+                               COLOR_GRAY, 2);
+                draw_text(&src_image, "[EXCLUDED]", det.xmin, det.ymin - 25, COLOR_GRAY, 10);
+            }
+
+            // 有效检测到的球（白色细框）
+            for (const auto& det : valid_ball_detections) {
                 draw_rectangle(&src_image, 
                                det.xmin, det.ymin,
                                det.xmax - det.xmin, det.ymax - det.ymin,
@@ -1475,7 +1953,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                 
                 char text[64];
                 snprintf(text, sizeof(text), "TARGET %.1f%%", det.score * 100);
-                draw_text(&src_image, text, det.xmin, det.ymin - 20, COLOR_RED, 10);
+                draw_text(&src_image, text, det.xmin, det.ymin - 25, COLOR_RED, 12);
             }
             
             // 跟踪框（绿色）
@@ -1486,22 +1964,60 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
                                COLOR_GREEN, 3);
                 
                 if (trk.is_predicted) {
-                    draw_text(&src_image, "[PRED]", trk.xmin, trk.ymin - 40, COLOR_YELLOW, 10);
+                    draw_text(&src_image, "[PRED]", trk.xmin, trk.ymin - 50, COLOR_YELLOW, 12);
                 }
             }
             
-            // 调试信息
-            char debug_text[128];
-            snprintf(debug_text, sizeof(debug_text), "[SPLIT] Balls:%zu->%zu Lost:%d",
-                     all_ball_detections.size(),
-                     ball_detections.size(),
-                     ball_selector.get_frames_since_lost());
-            draw_text(&src_image, debug_text, 10, 30, COLOR_YELLOW, 15);
+            // ===== 调试信息（字体放大）=====
+            int text_y = 40;
+            int line_height = 45;
+            int font_size = 20;
             
-            char crop_info[64];
-            snprintf(crop_info, sizeof(crop_info), "Crop:[%d,%d]-[%d,%d]",
-                     crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom);
-            draw_text(&src_image, crop_info, 10, 60, COLOR_RED, 12);
+            // 第一行：检测统计
+            char debug_text1[128];
+            snprintf(debug_text1, sizeof(debug_text1), "Detect: All=%zu Valid=%zu Excl=%zu",
+                     all_ball_detections.size(),
+                     valid_ball_detections.size(),
+                     excluded_detections.size());
+            draw_text(&src_image, debug_text1, 10, text_y, COLOR_YELLOW, font_size);
+            text_y += line_height;
+            
+            // 第二行：筛选和跟踪统计
+            char debug_text2[128];
+            snprintf(debug_text2, sizeof(debug_text2), "Select: Target=%zu Lost=%d Track=%d",
+                     ball_detections.size(),
+                     ball_selector.get_frames_since_lost(),
+                     tracker.HasActiveTrack() ? 1 : 0);
+            draw_text(&src_image, debug_text2, 10, text_y, COLOR_YELLOW, font_size);
+            text_y += line_height;
+            
+            // 第三行：黑名单和其他球场统计
+            char debug_text3[128];
+            snprintf(debug_text3, sizeof(debug_text3), "Filter: Blacklist=%d OtherCourt=%d",
+                     blacklist_count,
+                     other_court_count);
+            draw_text(&src_image, debug_text3, 10, text_y, COLOR_PURPLE, font_size);
+            text_y += line_height;
+            
+            // 第四行：裁剪框信息
+            char crop_info[128];
+            snprintf(crop_info, sizeof(crop_info), "Crop: [%d,%d]-[%d,%d] Center=(%.0f,%.0f)",
+                     crop_rect.left, crop_rect.top, crop_rect.right, crop_rect.bottom,
+                     crop_cx, crop_cy);
+            draw_text(&src_image, crop_info, 10, text_y, COLOR_RED, font_size);
+            text_y += line_height;
+            
+            // 第五行：区域信息
+            char region_info[128];
+            snprintf(region_info, sizeof(region_info), "Region: Valid=[0-%d] Exclude=[%d-%d]",
+                     EXCLUDE_RIGHT_START, EXCLUDE_RIGHT_START, PIC_FULL_WIDTH);
+            draw_text(&src_image, region_info, 10, text_y, COLOR_CYAN, font_size);
+            text_y += line_height;
+            
+            // 第六行：帧号
+            char frame_info[64];
+            snprintf(frame_info, sizeof(frame_info), "Frame: %d", frame_count);
+            draw_text(&src_image, frame_info, 10, text_y, COLOR_WHITE, font_size);
         }
 
         // ===== 更新运镜 =====
