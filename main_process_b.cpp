@@ -476,9 +476,9 @@ public:
     };
 
     struct DetectionResult {
-        std::vector<T_DetectObject> all_detections;
-        std::vector<T_DetectObject> valid_detections;
-        std::vector<T_DetectObject> excluded_detections;
+        std::vector<T_DetectObject> all_detections;          // 所有检测到的球
+        std::vector<T_DetectObject> valid_detections;        // 可以追踪的球
+        std::vector<T_DetectObject> excluded_detections;     // 不追踪的球
     };
 
     SplitRegionDetector(const DetectionConfig& config)
