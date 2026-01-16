@@ -272,6 +272,15 @@ private:
     int frames_without_target_{0};
 
     // 运镜参数
+    /* 参数调整场景建议
+    | 场景 | 调整方向 |
+    |------|----------|
+    | 画面抖动/晃动 | ↑ damping, ↓ stiffness, ↑ dead_zone |
+    | 跟随太慢/滞后 | ↑ stiffness, ↑ max_speed, ↑ prediction |
+    | 目标停止时过冲 | ↓ prediction, ↑ damping |
+    | 快速运动丢失目标 | ↑ max_speed, ↑ max_accel, ↑ prediction |
+    | 画面不够平滑 | ↓ velocity_smooth, ↑ damping |
+    */
     const float stiffness_ = 0.025f;
     const float damping_ = 0.55f;
     const float max_speed_ = 28.0f;
@@ -1747,7 +1756,7 @@ void consumer_thread(FrameQueue& fq, ImageBufferPool& pool, const char *model_pa
         // 执行检测
         auto det_result = detector.detect(&src_image, &rknn_app_ctx);
 
-        // 设置裁剪框中心偏好
+        // 设置裁剪框中心偏好，让球筛选器知道裁剪框在哪，从而优先选择裁剪框内或附近的球，避免镜头突然跳到远处的干扰球。
         ball_selector.set_crop_center(crop_cx, crop_cy);
 
         // 球筛选
