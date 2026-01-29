@@ -254,26 +254,7 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     // 开始计时
     gettimeofday(&start2, NULL);
     printf("rknn_run\n");
-    //fflush(stdout);
-    // while (1)
-    // {
-    //         // 开始计时
-    //     gettimeofday(&start2, NULL);
-    //     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
-    //     if (ret < 0)
-    //     {
-    //         printf("rknn_run fail! ret=%d\n", ret);
-    //         return -1;
-    //     }
-    //         // 结束计时
-    //     gettimeofday(&end2, NULL);
 
-        // 计算耗时（微秒→毫秒）
-        // time_use2 = (end2.tv_sec - start2.tv_sec) * 1000.0 +
-        //        (end2.tv_usec - start2.tv_usec) / 1000.0;
-        // printf("inference_yolov8_model rknpu2 耗时：%.3f ms\n", time_use2);
-
-    // }
 
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
     if (ret < 0)
@@ -299,6 +280,7 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     printf("rknn_outputs_get\n");
     // 开始计时
     gettimeofday(&start3, NULL);
+    //获得输出
     ret = rknn_outputs_get(app_ctx->rknn_ctx, app_ctx->io_num.n_output, outputs, NULL);
     if (ret < 0)
     {
@@ -320,7 +302,7 @@ int inference_yolov8_model(rknn_app_context_t *app_ctx, image_buffer_t *img, obj
     //如果rk平台的后处理有问题的话可以试试换成联咏的后处理流程
     // 开始计时
     gettimeofday(&start4, NULL);
-    post_process(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
+    post_process_yolo26(app_ctx, outputs, &letter_box, box_conf_threshold, nms_threshold, od_results);
     printf("post_process success!\n");
     // 结束计时
     gettimeofday(&end4, NULL);

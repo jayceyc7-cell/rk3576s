@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <algorithm>
 
 #include <set>
 #include <vector>
@@ -29,6 +30,16 @@
 static char *labels[OBJ_CLASS_NUM];
 
 inline static int clamp(float val, int min, int max) { return val > min ? (val < max ? val : max) : min; }
+
+typedef struct
+{
+    float xmin;
+    float ymin;
+    float xmax;
+    float ymax;
+    float score;
+    int classId;
+} DetectRect;
 
 static char *readLine(FILE *fp, char *buffer, int *len)
 {
@@ -514,6 +525,328 @@ void print_int8_tensor(int8_t* data, int size, int N)
     }
     printf("\n");
 }
+
+
+// yolo26
+
+/*claude 无nms版本*/
+
+// int post_process_yolo26(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, 
+//                         float conf_threshold, float nms_threshold, object_detect_result_list *od_results)
+// {
+//     printf("post_process_yolo26\n");
+
+//     rknn_output *_outputs = (rknn_output *)outputs;
+    
+//     int model_in_w = app_ctx->model_width;
+//     int model_in_h = app_ctx->model_height;
+//     int class_num = 3;  // 根据你的模型调整
+    
+//     printf("model_in_w %d, model_in_h %d\n", model_in_w, model_in_h);
+//     memset(od_results, 0, sizeof(object_detect_result_list));
+
+//     // YOLOv26: 每个 head 有 2 个输出 (reg, cls)
+//     int num_heads = app_ctx->io_num.n_output / 2;
+//     printf("num_heads: %d, total outputs: %d\n", num_heads, app_ctx->io_num.n_output);
+
+//     if (app_ctx->io_num.n_output % 2 != 0)
+//     {
+//         printf("[ERROR] Invalid YOLO output layout: n_output=%d\n", app_ctx->io_num.n_output);
+//         return -1;
+//     }
+
+//     std::vector<DetectRect> detectRects;
+
+//     for (int i = 0; i < num_heads; i++)
+//     {
+//         int reg_idx = i * 2;
+//         int cls_idx = i * 2 + 1;
+
+//         int8_t *reg = (int8_t *)_outputs[reg_idx].buf;
+//         int32_t reg_zp = app_ctx->output_attrs[reg_idx].zp;
+//         float reg_scale = app_ctx->output_attrs[reg_idx].scale;
+
+//         int8_t *cls = (int8_t *)_outputs[cls_idx].buf;
+//         int32_t cls_zp = app_ctx->output_attrs[cls_idx].zp;
+//         float cls_scale = app_ctx->output_attrs[cls_idx].scale;
+
+//         int grid_h = app_ctx->output_attrs[reg_idx].dims[2];
+//         int grid_w = app_ctx->output_attrs[reg_idx].dims[3];
+//         int stride = model_in_h / grid_h;
+
+//         printf("Head %d: reg_idx=%d, cls_idx=%d, grid_h=%d, grid_w=%d, stride=%d\n", 
+//                i, reg_idx, cls_idx, grid_h, grid_w, stride);
+
+//         for (int h = 0; h < grid_h; h++)
+//         {
+//             for (int w = 0; w < grid_w; w++)
+//             {
+//                 // 找到最大类别置信度
+//                 int8_t cls_max = 0;
+//                 int cls_index = 0;
+                
+//                 for (int c = 0; c < class_num; c++)
+//                 {
+//                     int8_t cls_val = cls[c * grid_h * grid_w + h * grid_w + w];
+//                     if (c == 0 || cls_val > cls_max)
+//                     {
+//                         cls_max = cls_val;
+//                         cls_index = c;
+//                     }
+//                 }
+
+//                 float max_score = sigmoid(deqnt_affine_to_f32(cls_max, cls_zp, cls_scale));
+
+//                 if (max_score < conf_threshold)
+//                 {
+//                     continue;
+//                 }
+
+//                 // 解码边界框
+//                 float reg_l = deqnt_affine_to_f32(reg[0 * grid_h * grid_w + h * grid_w + w], reg_zp, reg_scale);
+//                 float reg_t = deqnt_affine_to_f32(reg[1 * grid_h * grid_w + h * grid_w + w], reg_zp, reg_scale);
+//                 float reg_r = deqnt_affine_to_f32(reg[2 * grid_h * grid_w + h * grid_w + w], reg_zp, reg_scale);
+//                 float reg_b = deqnt_affine_to_f32(reg[3 * grid_h * grid_w + h * grid_w + w], reg_zp, reg_scale);
+
+//                 float cx = (w + 0.5f) * stride;
+//                 float cy = (h + 0.5f) * stride;
+
+//                 float xmin = cx - reg_l * stride;
+//                 float ymin = cy - reg_t * stride;
+//                 float xmax = cx + reg_r * stride;
+//                 float ymax = cy + reg_b * stride;
+
+//                 xmin = std::max(0.0f, std::min(xmin, (float)model_in_w));
+//                 ymin = std::max(0.0f, std::min(ymin, (float)model_in_h));
+//                 xmax = std::max(0.0f, std::min(xmax, (float)model_in_w));
+//                 ymax = std::max(0.0f, std::min(ymax, (float)model_in_h));
+
+//                 if (xmax > xmin && ymax > ymin)
+//                 {
+//                     DetectRect temp;
+//                     temp.xmin = xmin;
+//                     temp.ymin = ymin;
+//                     temp.xmax = xmax;
+//                     temp.ymax = ymax;
+//                     temp.classId = cls_index;
+//                     temp.score = max_score;
+//                     detectRects.push_back(temp);
+//                 }
+//             }
+//         }
+//     }
+
+//     // 按置信度排序
+//     std::sort(detectRects.begin(), detectRects.end(), [](const DetectRect &a, const DetectRect &b) {
+//         return a.score > b.score;
+//     });
+
+//     // 直接输出结果，不做 NMS
+//     int result_count = 0;
+//     for (size_t i = 0; i < detectRects.size() && i < OBJ_NUMB_MAX_SIZE; i++)
+//     {
+//         const DetectRect &rect = detectRects[i];
+
+//         float x1 = (rect.xmin - letter_box->x_pad) / letter_box->scale;
+//         float y1 = (rect.ymin - letter_box->y_pad) / letter_box->scale;
+//         float x2 = (rect.xmax - letter_box->x_pad) / letter_box->scale;
+//         float y2 = (rect.ymax - letter_box->y_pad) / letter_box->scale;
+
+//         od_results->results[result_count].box.left = (int)x1;
+//         od_results->results[result_count].box.top = (int)y1;
+//         od_results->results[result_count].box.right = (int)x2;
+//         od_results->results[result_count].box.bottom = (int)y2;
+//         od_results->results[result_count].prop = rect.score;
+//         od_results->results[result_count].cls_id = rect.classId;
+
+//         result_count++;
+//     }
+    
+//     od_results->count = result_count;
+//     printf("Total detections: %d\n", result_count);
+
+//     return 0;
+// }
+
+
+/* ctx */
+
+int post_process_yolo26(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, object_detect_result_list *od_results)
+{
+    printf("yolo26 ctx post_process\n");
+
+    rknn_output *_outputs = (rknn_output *)outputs;
+    
+    std::vector<float> filterBoxes;
+    std::vector<float> objProbs;
+    std::vector<int> classId;
+    int validCount = 0;
+    int stride = 0;
+    int grid_h = 0;
+    int grid_w = 0;
+    int model_in_w = app_ctx->model_width;
+    int model_in_h = app_ctx->model_height;
+    int class_num = 3;
+    printf("model_in_w %d, model_in_h %d\n", model_in_w, model_in_h);
+    memset(od_results, 0, sizeof(object_detect_result_list));
+
+    // default 3 branch
+    // int dfl_len = app_ctx->output_attrs[0].dims[1] / 4;
+    // int output_per_branch = app_ctx->io_num.n_output / 2;
+    // printf("output_per_branch %d\n", output_per_branch);
+
+    //**************************/
+
+    int num_heads = app_ctx->io_num.n_output / 2;
+
+    if (app_ctx->io_num.n_output % 2 != 0)
+    {
+        printf("[ERROR] Invalid YOLO output layout: n_output=%d\n",
+               app_ctx->io_num.n_output);
+        return -1;
+    }
+
+
+    int8_t cls_val = 0;
+    int8_t cls_max = 0;
+    float max_cls_num;
+    int cls_index = 0;
+
+    float locval = 0;
+    std::vector<float> RegDFL;
+    std::vector<DetectRect> detectRects;
+    
+    for (int i = 0; i < num_heads; i++)
+    {
+        int reg_idx = i * 2;
+        int cls_idx = i * 2 + 1;
+
+        int8_t *cls = nullptr;
+        int32_t cls_sum_zp = 0;
+        float cls_sum_scale = 1.0f;
+        
+        int8_t *reg = nullptr;
+        int32_t reg_sum_zp = 0;
+        float reg_sum_scale = 1.0f;
+
+        
+        float xmin = 0, ymin = 0, xmax = 0, ymax = 0;
+        
+        cls = (int8_t *)_outputs[cls_idx].buf;
+        cls_sum_zp = app_ctx->output_attrs[cls_idx].zp;
+        cls_sum_scale = app_ctx->output_attrs[cls_idx].scale;
+        reg = (int8_t *)_outputs[reg_idx].buf;
+        reg_sum_zp = app_ctx->output_attrs[reg_idx].zp;
+        reg_sum_scale = app_ctx->output_attrs[reg_idx].scale;
+        
+        grid_h = app_ctx->output_attrs[reg_idx].dims[2];
+        grid_w = app_ctx->output_attrs[reg_idx].dims[3];
+        stride = model_in_h / grid_h;
+
+        //printf("grid_h %d, grid_w %d, stride %d\n", grid_h, grid_w, stride);
+        
+        for (int h = 0; h < grid_h; h++)
+        {
+            for (int w = 0; w < grid_w; w++)
+            {
+                for (int cl = 0; cl < class_num; cl++)
+                {
+                    cls_val = cls[cl * grid_h * grid_w + h * grid_w + w];
+                    if (0 == cl)
+                    {
+                        cls_max = cls_val;
+                        cls_index = cl;
+                    }
+                    else
+                    {
+                        if (cls_val > cls_max)
+                        {
+                            cls_max = cls_val;
+                            cls_index = cl;
+                        }
+                    }
+                }
+                max_cls_num = sigmoid(deqnt_affine_to_f32(cls_max, cls_sum_zp, cls_sum_scale));
+                //printf("before_cls_max %f, cls_index %d\n", max_cls_num, cls_index);
+                if(max_cls_num > conf_threshold)
+                {
+                    validCount++;
+                    RegDFL.clear();
+                    for(int lc = 0; lc < 4; lc++){
+                        locval = 0;
+                        locval = reg[lc * grid_h * grid_w + h * grid_w + w];
+                        locval = deqnt_affine_to_f32(locval, reg_sum_zp, reg_sum_scale);
+                        // locval = sigmoid(locval);
+                        RegDFL.push_back(locval);
+                    }
+                    //printf(" reg_l:%f, reg_t:%f, reg_r:%f, reg_b:%f\n", RegDFL[0], RegDFL[1], RegDFL[2], RegDFL[3]);
+
+                    xmin = (float(w + 0.5) - RegDFL[0]) * stride;
+                    ymin = (float(h + 0.5) - RegDFL[1]) * stride;
+                    xmax = (float(w + 0.5) + RegDFL[2]) * stride;
+                    ymax = (float(h + 0.5) + RegDFL[3]) * stride;
+
+
+                    xmin = xmin > 0 ? xmin : 0;
+                    ymin = ymin > 0 ? ymin : 0;
+                    xmax = xmax < model_in_w ? xmax : model_in_w;
+                    ymax = ymax < model_in_h ? ymax : model_in_h;
+
+                    if (xmin >= 0 && ymin >= 0 && xmax <= model_in_w && ymax <= model_in_h)
+                    {
+                        DetectRect temp;
+                        temp.xmin = xmin;
+                        temp.ymin = ymin;
+                        temp.xmax = xmax;
+                        temp.ymax = ymax;
+                        temp.classId = cls_index;
+                        temp.score = max_cls_num;
+                        //printf(" xmin:%f, ymin:%f, xmax:%f, ymax:%f, cls_index:%d, max_cls_num:%f\n", xmin, ymin, xmax, ymax, cls_index, max_cls_num);
+                        detectRects.push_back(temp);
+                    }
+                }
+            }
+        }
+    }
+
+
+    std::sort(detectRects.begin(), detectRects.end(), [](DetectRect &Rect1, DetectRect &Rect2) -> bool
+              { return (Rect1.score > Rect2.score); });
+
+    int last_count = 0;
+    /* box valid detect target */
+    for (int i = 0; i < validCount; ++i)
+    {
+        if (i >= OBJ_NUMB_MAX_SIZE)
+        {
+            continue;
+        }
+        DetectRect temp = detectRects[i];
+
+        float x1 = temp.xmin - letter_box->x_pad;
+        float y1 = temp.ymin - letter_box->y_pad;
+        float x2 = temp.xmax - letter_box->x_pad;
+        float y2 = temp.ymax - letter_box->y_pad;
+        int id = temp.classId;
+        float obj_conf = temp.score;
+
+        od_results->results[i].box.left = (int)x1 / letter_box->scale;
+        od_results->results[i].box.top = (int)y1 / letter_box->scale;
+        od_results->results[i].box.right = (int)x2 / letter_box->scale;
+        od_results->results[i].box.bottom = (int)y2 / letter_box->scale;
+        //printf("model_in_h=%d, model_in_w=%d\n", model_in_h, model_in_w);
+        od_results->results[i].prop = obj_conf;
+        od_results->results[i].cls_id = id;
+        last_count++;
+    }
+    od_results->count = last_count;
+    return 0;
+}
+
+
+
+
+
 
 
 int post_process(rknn_app_context_t *app_ctx, void *outputs, letterbox_t *letter_box, float conf_threshold, float nms_threshold, object_detect_result_list *od_results)
